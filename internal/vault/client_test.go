@@ -259,3 +259,70 @@ func TestTLSVerificationCanBeEnabled(t *testing.T) {
 		t.Fatal("New succeeded against a self-signed server with verification enabled")
 	}
 }
+
+func TestNewUnauthenticatedDoesNotLogIn(t *testing.T) {
+	var paths []string
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if _, ok := r.Header["X-Vault-Token"]; ok {
+			t.Errorf("X-Vault-Token sent to %s", r.URL.Path)
+		}
+		_, _ = fmt.Fprint(w, "PEM")
+	})
+
+	// No auth_method, no role_id, no JWT path: the CA chain endpoint is public.
+	c, err := vault.NewUnauthenticated(config.VaultConfig{Addr: srv.URL})
+	if err != nil {
+		t.Fatalf("NewUnauthenticated: %v", err)
+	}
+	body, err := c.Get("pki_int/ca_chain")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(body) != "PEM" {
+		t.Errorf("body = %q", body)
+	}
+	if len(paths) != 1 || paths[0] != "/v1/pki_int/ca_chain" {
+		t.Errorf("requests = %v, want a single GET of the chain", paths)
+	}
+}
+
+func TestGetSendsTheTokenWhenAuthenticated(t *testing.T) {
+	var token string
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/login") {
+			_, _ = fmt.Fprint(w, `{"auth":{"client_token":"s.token"}}`)
+			return
+		}
+		token = r.Header.Get("X-Vault-Token")
+		_, _ = fmt.Fprint(w, "PEM")
+	})
+
+	c, err := vault.New(baseConfig(srv.URL))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := c.Get("pki_int/ca_chain"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if token != "s.token" {
+		t.Errorf("X-Vault-Token = %q", token)
+	}
+}
+
+func TestGetSurfacesTheStatusAndBody(t *testing.T) {
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprint(w, `{"errors":["unsupported path"]}`)
+	})
+
+	c, err := vault.NewUnauthenticated(config.VaultConfig{Addr: srv.URL})
+	if err != nil {
+		t.Fatalf("NewUnauthenticated: %v", err)
+	}
+	if _, err := c.Get("pki_int/ca_chain"); err == nil ||
+		!strings.Contains(err.Error(), "vault returned 404") ||
+		!strings.Contains(err.Error(), "unsupported path") {
+		t.Errorf("error = %v, want the status and Vault's message", err)
+	}
+}

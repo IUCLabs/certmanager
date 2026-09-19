@@ -31,8 +31,8 @@ cmd/certmanager/main.go       # CLI (flattened: the positional arg is the comman
 cmd/certmanager/main_test.go  # end-to-end tests against an httptest Vault stub
 test/integration/             # end-to-end tests against a real Vault dev server
 internal/config/              # YAML config: parsing, defaults, validation
-internal/pki/                 # issue request/response + the JSON output shape
-internal/vault/               # authenticated HTTP client (approle, kubernetes)
+internal/pki/                 # issue + ca_chain requests and the output shapes
+internal/vault/               # HTTP client: approle, kubernetes, unauthenticated
 Makefile                      # build / test / lint / completions / version bump
 .goreleaser.yaml              # single release driver: binaries + RPM + Gitea release
 scripts/integration-test.sh   # runs the integration test against a Vault dev server
@@ -46,7 +46,12 @@ dist/                         # build output: binaries, RPM, checksums (not comm
   wires it to the real streams and `os.Exit`. Cobra runs with `SilenceUsage` and
   `SilenceErrors` so nothing reaches stderr unless the run failed.
 - **Flat CLI**: the root command takes `common_name` positionally
-  (`cobra.ExactArgs(1)`). Only `completion` and `help` are subcommands.
+  (`cobra.ExactArgs(1)`). `ca`, `completion` and `help` are the only
+  subcommands; `--config` is persistent so `ca` shares it.
+- **`ca` is unauthenticated**: `GET {addr}/v1/{mount}/ca_chain` sends no
+  `X-Vault-Token` and loads the config through `config.LoadCA`, which requires
+  only `vault.addr`. The body is parsed as PEM, never sniffed — Vault labels it
+  `application/pkix-cert`. It prints raw PEM: Puppet uses it as file content.
 - **`parseList`** splits comma lists, trims whitespace, drops empty tokens.
 - **`config.Load`** applies defaults (`auth_method: approle`, `jwt_path`) then
   `Validate()`, which names the offending key and rejects an unknown
@@ -59,8 +64,10 @@ dist/                         # build output: binaries, RPM, checksums (not comm
 
 ## Deliberate deviations from the Python script
 
-- Emits `ca_certificate`; the Python did not, so Puppet's
-  `/etc/pki/tls/vault/ca_certificate.crt` was silently never populated.
+- The CA is served by `certmanager ca` from the mount's `/ca_chain`, not welded
+  to issuance. `issuing_ca` is the intermediate only, and deriving the CA from
+  an issue response would pin CA rotation to each node's 90 day renewal.
+- `full_chain` is leaf first; the Python put the issuer first.
 - `output_path` is read from under `vault:` where it is actually written. The
   Python declared it at the top level but read it from the unwrapped `vault`
   dict, so it never resolved.

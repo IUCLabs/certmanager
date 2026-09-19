@@ -17,6 +17,9 @@ import (
 // maxErrorBody caps how much of a Vault error response is quoted back.
 const maxErrorBody = 2048
 
+// maxBody caps a GET response; the CA chain is a handful of kilobytes.
+const maxBody = 1 << 20
+
 // Client is an authenticated Vault HTTP client.
 type Client struct {
 	addr  string
@@ -28,20 +31,9 @@ type Client struct {
 // Client. An unknown method, or a failure of the selected method, is an error:
 // there is no fallback between methods.
 func New(cfg config.VaultConfig) (*Client, error) {
-	timeout, err := cfg.RequestTimeout()
+	c, err := newClient(cfg)
 	if err != nil {
 		return nil, err
-	}
-
-	transport := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: cfg.SkipTLSVerify()}, //nolint:gosec // defaults to the Python script's verify=False; flip vault.tls_skip_verify to enable
-		TLSHandshakeTimeout:   timeout,
-		ResponseHeaderTimeout: timeout,
-	}
-
-	c := &Client{
-		addr: strings.TrimRight(cfg.Addr, "/"),
-		http: &http.Client{Transport: transport, Timeout: timeout},
 	}
 
 	switch cfg.AuthMethod {
@@ -57,6 +49,31 @@ func New(cfg config.VaultConfig) (*Client, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// NewUnauthenticated returns a Client that performs no login and holds no
+// token. The PKI CA endpoints are public, so the CA chain is reachable from a
+// config that carries no credentials at all.
+func NewUnauthenticated(cfg config.VaultConfig) (*Client, error) {
+	return newClient(cfg)
+}
+
+func newClient(cfg config.VaultConfig) (*Client, error) {
+	timeout, err := cfg.RequestTimeout()
+	if err != nil {
+		return nil, err
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: cfg.SkipTLSVerify()}, //nolint:gosec // defaults to the Python script's verify=False; flip vault.tls_skip_verify to enable
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+	}
+
+	return &Client{
+		addr: strings.TrimRight(cfg.Addr, "/"),
+		http: &http.Client{Transport: transport, Timeout: timeout},
+	}, nil
 }
 
 func (c *Client) loginAppRole(cfg config.VaultConfig) error {
@@ -103,6 +120,36 @@ func (c *Client) fetchToken(authPath string, payload any) (string, error) {
 		return "", fmt.Errorf("vault returned no auth.client_token")
 	}
 	return result.Auth.ClientToken, nil
+}
+
+// Get sends a GET to a Vault path and returns the raw body undecoded. The
+// X-Vault-Token header is omitted entirely when the client holds no token.
+func (c *Client) Get(path string) ([]byte, error) {
+	url := fmt.Sprintf("%s/v1/%s", c.addr, path)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("X-Vault-Token", c.token)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		return nil, fmt.Errorf("GET %s: vault returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(detail)))
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: read response: %w", path, err)
+	}
+	return body, nil
 }
 
 // Post sends an authenticated POST to a Vault path and decodes the response.

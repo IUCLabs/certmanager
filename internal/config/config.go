@@ -85,6 +85,31 @@ func (v VaultConfig) RequestTimeout() (time.Duration, error) {
 
 // Load reads, parses, defaults and validates the config file at path.
 func Load(path string) (*Config, error) {
+	cfg, err := parse(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Vault.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config %q: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// LoadCA reads the config for the CA chain path. That endpoint is public, so
+// only vault.addr is required: a config carrying no auth method, no role and no
+// credentials still loads.
+func LoadCA(path string) (*Config, error) {
+	cfg, err := parse(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Vault.ValidateCA(); err != nil {
+		return nil, fmt.Errorf("invalid config %q: %w", path, err)
+	}
+	return cfg, nil
+}
+
+func parse(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open config %q: %w", path, err)
@@ -102,11 +127,19 @@ func Load(path string) (*Config, error) {
 	if cfg.Vault.JWTPath == "" {
 		cfg.Vault.JWTPath = DefaultJWTPath
 	}
-
-	if err := cfg.Vault.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid config %q: %w", path, err)
-	}
 	return &cfg, nil
+}
+
+// ValidateCA rejects a config that could not reach the CA chain endpoint. It
+// deliberately ignores every auth key: the endpoint is unauthenticated.
+func (v VaultConfig) ValidateCA() error {
+	if v.Addr == "" {
+		return fmt.Errorf("vault.addr is required")
+	}
+	if _, err := v.RequestTimeout(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Validate rejects a config that could not produce a certificate, naming the

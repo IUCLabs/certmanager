@@ -19,7 +19,8 @@ failure path exits non-zero.
 ## Usage
 
 ```
-certmanager <common_name> [flags]
+certmanager <common_name> [flags]   # issue a certificate
+certmanager ca [flags]              # print the CA chain
 ```
 
 | Flag | Short | Type | Default | Description |
@@ -31,6 +32,12 @@ certmanager <common_name> [flags]
 | `--json` | | bool | `false` | Print the certificate data as JSON |
 | `--config` | | path | `/opt/certmanager/config.yaml` | Config file location |
 
+`ca` takes `--config` plus:
+
+| Flag | Short | Type | Default | Description |
+|---|---|---|---|---|
+| `--mount` | `-m` | string | `vault.mount_point` | PKI mount to read |
+
 Comma lists are split on `,`, whitespace-trimmed, and empty tokens dropped.
 
 ### JSON output
@@ -39,15 +46,15 @@ Comma lists are split on `,`, whitespace-trimmed, and empty tokens dropped.
 {
   "certificate": "<PEM leaf>",
   "private_key": "<PEM key>",
-  "full_chain": "<issuing_ca PEM>\n<certificate PEM>",
-  "ca_certificate": "<issuing_ca PEM>"
+  "full_chain": "<certificate PEM>\n<issuing_ca PEM>"
 }
 ```
 
-`ca_certificate` is new. `profiles::pki::vault` writes
-`$cert_data['ca_certificate']` to `/etc/pki/tls/vault/ca_certificate.crt`, but
-the Python never emitted the key, so Puppet saw `undef` and the file was never
-populated.
+`full_chain` is leaf first, the order every TLS server expects.
+
+The CA is not part of this document. It is estate-wide and public, so binding
+it to a node's issuance would pin CA distribution to that node's renewal cycle;
+`certmanager ca` fetches it instead.
 
 ### File output
 
@@ -58,11 +65,39 @@ Without `--json` the certificate is written under `vault.output_path`
 |---|---|
 | `<output_path>/<common_name>/certificate.crt` | Signed certificate |
 | `<output_path>/<common_name>/private.key` | Private key (mode 0600) |
-| `<output_path>/<common_name>/full_chain.crt` | Issuing CA + certificate |
-| `<output_path>/<common_name>/ca_certificate.crt` | Issuing CA certificate |
+| `<output_path>/<common_name>/full_chain.crt` | Certificate + issuing CA |
 
-With `-c` the same four files are written into
+With `-c` the same three files are written into
 `<output_path>/<common_name>.zip`.
+
+## The `ca` subcommand
+
+```
+certmanager ca [--mount <pki_mount>] [--config <path>]
+```
+
+Prints the mount's CA chain to stdout as raw PEM — not JSON, because Puppet
+uses it as file content directly:
+
+```puppet
+file { '/etc/pki/tls/vault/ca_certificate.crt':
+  content => generate('/usr/local/bin/certmanager', 'ca'),
+}
+```
+
+It reads `GET {addr}/v1/{mount}/ca_chain` unauthenticated: no AppRole login, no
+Kubernetes login, no token header. A config carrying only `addr` and
+`mount_point` is enough, and `--mount` overrides the configured mount.
+
+`/ca_chain` returns the intermediate **and** the root, unlike `issuing_ca` or
+`/ca/pem`, which return the intermediate alone. An intermediate-only `CAfile`
+is not self-sufficient: strict path builders that require a chain to a
+self-signed root reject it.
+
+The endpoint advertises `application/pkix-cert` while serving PEM, so the body
+is parsed rather than sniffed. A non-200, an empty body or anything that is not
+a PEM certificate chain exits non-zero with the cause on stderr and nothing on
+stdout.
 
 ## Configuration
 
@@ -74,11 +109,11 @@ YAML, everything nested under `vault:`. The path is baked in at build time
 | `addr` | yes | | e.g. `https://vault.example.com:8200` |
 | `auth_method` | no | `approle` | `approle` or `kubernetes` |
 | `mount_point` | yes | | e.g. `pki_int` |
-| `role_name` | yes | | e.g. `my-role` |
-| `role_id` | iff `approle` | | |
-| `approle_path` | iff `approle` | | e.g. `approle` |
-| `k8s_mount` | iff `kubernetes` | | e.g. `kubernetes` |
-| `k8s_role` | iff `kubernetes` | | e.g. `my-certmanager-role` |
+| `role_name` | iff issuing | | e.g. `my-role` |
+| `role_id` | iff `approle` and issuing | | |
+| `approle_path` | iff `approle` and issuing | | e.g. `approle` |
+| `k8s_mount` | iff `kubernetes` and issuing | | e.g. `kubernetes` |
+| `k8s_role` | iff `kubernetes` and issuing | | e.g. `my-certmanager-role` |
 | `jwt_path` | no | `/var/run/secrets/kubernetes.io/serviceaccount/token` | |
 | `output_path` | no | `.` | Non-JSON output directory |
 | `tls_skip_verify` | no | `true` | Set `false` once every node trusts the CA |
@@ -94,6 +129,8 @@ vault:
   role_name: my-role
   output_path: /tmp/certmanager
 ```
+
+`ca` requires only `addr` and a mount; every auth key above is optional for it.
 
 AppRole logs in with `role_id` only — the Vault role sets
 `bind_secret_id: false`. Kubernetes reads the JWT from `jwt_path` and posts it
@@ -115,7 +152,9 @@ make release-snapshot  # goreleaser: binaries, tar.gz and RPM into dist/
 
 `make integration-test` starts a `hashicorp/vault` dev container with
 docker/podman, provisions a PKI mount and an approle role, then runs the built
-binary with the exact argv Puppet uses and asserts on the issued certificate.
+binary with the exact argv Puppet uses and asserts on the issued certificate. A
+root mount signs an intermediate so the CA chain under test is the two
+certificate shape production serves.
 Point it at an existing dev server with `CERTMANAGER_IT_VAULT_ADDR`
 (`VAULT_ADDR` is deliberately ignored — the test writes to the PKI mount).
 

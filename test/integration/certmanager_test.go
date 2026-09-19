@@ -19,12 +19,18 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 const (
-	pkiMount    = "pki"
+	// Dev-mode Vault has no PKI of its own, and a single root mount would make
+	// the CA chain one self-signed certificate -- which would not exercise the
+	// intermediate + root shape production serves. So a root mount signs an
+	// intermediate, and certificates are issued from the intermediate.
+	rootMount   = "pki_root"
+	pkiMount    = "pki_int"
 	pkiRole     = "puppet"
 	approlePath = "approle"
 	approleRole = "certmanager"
@@ -123,18 +129,59 @@ func vaultReq(t *testing.T, method, path string, payload any, okErrors ...string
 	return out
 }
 
-// setupVault provisions the PKI mount, issuing role, policy and approle role,
-// returning the role_id certmanager will authenticate with.
+// setupVault provisions the mounts, issuing role, policy and approle role,
+// returning the role_id certmanager will authenticate with. Provisioning runs
+// once per process: re-signing the intermediate would add issuers and make the
+// mount's CA chain non-deterministic.
 func setupVault(t *testing.T) string {
 	t.Helper()
+	setupOnce.Do(func() { setupRoleID = provisionVault(t) })
+	if setupRoleID == "" {
+		t.Fatal("vault provisioning failed")
+	}
+	return setupRoleID
+}
 
+var (
+	setupOnce   sync.Once
+	setupRoleID string
+)
+
+func provisionVault(t *testing.T) string {
+	t.Helper()
+
+	vaultReq(t, http.MethodPost, "sys/mounts/"+rootMount,
+		map[string]any{"type": "pki", "config": map[string]any{"max_lease_ttl": "87600h"}},
+		"path is already in use")
 	vaultReq(t, http.MethodPost, "sys/mounts/"+pkiMount,
 		map[string]any{"type": "pki", "config": map[string]any{"max_lease_ttl": "87600h"}},
 		"path is already in use")
 
-	vaultReq(t, http.MethodPost, pkiMount+"/root/generate/internal", map[string]any{
-		"common_name": certDomain + " integration CA",
+	root := vaultReq(t, http.MethodPost, rootMount+"/root/generate/internal", map[string]any{
+		"common_name": certDomain + " integration root CA",
 		"ttl":         "87600h",
+		"key_type":    "rsa",
+		"key_bits":    2048,
+	})
+	rootPEM := dataString(t, root, "certificate")
+
+	csr := vaultReq(t, http.MethodPost, pkiMount+"/intermediate/generate/internal", map[string]any{
+		"common_name": certDomain + " integration intermediate CA",
+		"key_type":    "rsa",
+		"key_bits":    2048,
+	})
+
+	signed := vaultReq(t, http.MethodPost, rootMount+"/root/sign-intermediate", map[string]any{
+		"csr":         dataString(t, csr, "csr"),
+		"common_name": certDomain + " integration intermediate CA",
+		"ttl":         "43800h",
+		"format":      "pem",
+	})
+
+	// Appending the root to the signed intermediate is what makes /ca_chain
+	// serve both certificates.
+	vaultReq(t, http.MethodPost, pkiMount+"/intermediate/set-signed", map[string]any{
+		"certificate": dataString(t, signed, "certificate") + "\n" + rootPEM,
 	})
 
 	vaultReq(t, http.MethodPost, pkiMount+"/roles/"+pkiRole, map[string]any{
@@ -170,6 +217,16 @@ func setupVault(t *testing.T) string {
 		t.Fatal("vault returned an empty approle role_id")
 	}
 	return roleID
+}
+
+func dataString(t *testing.T, resp map[string]any, key string) string {
+	t.Helper()
+	data, _ := resp["data"].(map[string]any)
+	v, _ := data[key].(string)
+	if v == "" {
+		t.Fatalf("vault returned no data.%s", key)
+	}
+	return v
 }
 
 // buildBinary compiles certmanager with the config path baked in, so the test
@@ -263,10 +320,16 @@ func TestIssueCertificateAgainstVault(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
 		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
 	}
-	for _, key := range []string{"certificate", "private_key", "full_chain", "ca_certificate"} {
+	for _, key := range []string{"certificate", "private_key", "full_chain"} {
 		if doc[key] == "" {
 			t.Errorf("JSON key %q is missing or empty", key)
 		}
+	}
+	if _, ok := doc["ca_certificate"]; ok {
+		t.Error("ca_certificate must not be emitted; the CA comes from the ca subcommand")
+	}
+	if len(doc) != 3 {
+		t.Errorf("document has %d keys, want exactly 3: %v", len(doc), keysOf(doc))
 	}
 
 	cert := parseCert(t, doc["certificate"])
@@ -290,16 +353,173 @@ func TestIssueCertificateAgainstVault(t *testing.T) {
 		t.Errorf("certificate lifetime %v, want ~%dd", lifetime, expiryDays)
 	}
 
-	ca := parseCert(t, doc["ca_certificate"])
-	if !ca.IsCA {
-		t.Errorf("ca_certificate is not a CA certificate")
+	// full_chain is leaf first: asserted as an order, not as membership.
+	chain := parseChain(t, doc["full_chain"])
+	if len(chain) != 2 {
+		t.Fatalf("full_chain carries %d certificates, want leaf + issuing CA", len(chain))
 	}
-	if err := cert.CheckSignatureFrom(ca); err != nil {
-		t.Errorf("certificate is not signed by ca_certificate: %v", err)
+	if !chain[0].Equal(cert) {
+		t.Errorf("full_chain starts with %q, want the leaf %q", chain[0].Subject.CommonName, commonName)
 	}
-	if !strings.Contains(doc["full_chain"], strings.TrimSpace(doc["certificate"])) ||
-		!strings.Contains(doc["full_chain"], strings.TrimSpace(doc["ca_certificate"])) {
-		t.Errorf("full_chain does not contain both the leaf and the issuing CA")
+	if !chain[1].IsCA {
+		t.Errorf("full_chain[1] (%q) is not a CA certificate", chain[1].Subject.CommonName)
+	}
+	if err := chain[0].CheckSignatureFrom(chain[1]); err != nil {
+		t.Errorf("full_chain is not leaf-then-issuer: %v", err)
+	}
+}
+
+// TestCAChainAgainstVault is the reason the CA no longer rides along with
+// issuance: this runs with no credentials at all.
+func TestCAChainAgainstVault(t *testing.T) {
+	waitForVault(t)
+	roleID := setupVault(t)
+
+	dir := t.TempDir()
+	cfg := writeConfig(t, dir, roleID)
+	bin := buildBinary(t, dir, cfg)
+
+	code, stdout, stderr := runCertmanager(t, bin, "ca")
+	if code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr)
+	}
+	if stderr != "" {
+		t.Errorf("stderr must be empty on success, got %q", stderr)
+	}
+
+	// Puppet reads this through generate() too, so it must be the PEM and
+	// nothing else.
+	if !strings.HasPrefix(stdout, "-----BEGIN CERTIFICATE-----") {
+		t.Fatalf("stdout is not a PEM document: %q", stdout)
+	}
+
+	chain := parseChain(t, stdout)
+	if len(chain) != 2 {
+		t.Fatalf("CA chain carries %d certificates, want intermediate + root", len(chain))
+	}
+	intermediate, root := chain[0], chain[1]
+
+	if !intermediate.IsCA || !root.IsCA {
+		t.Errorf("both chain entries must be CA certificates: %v, %v", intermediate.IsCA, root.IsCA)
+	}
+	// The root anchors the chain: self-issued and self-signed. issuing_ca alone
+	// would not be, which is what breaks strict path builders.
+	if root.Subject.String() != root.Issuer.String() {
+		t.Errorf("chain[1] subject %q != issuer %q, so it is not the root", root.Subject, root.Issuer)
+	}
+	if err := root.CheckSignatureFrom(root); err != nil {
+		t.Errorf("chain[1] is not self-signed: %v", err)
+	}
+	if intermediate.Subject.String() == intermediate.Issuer.String() {
+		t.Errorf("chain[0] %q is self-issued; expected the intermediate", intermediate.Subject)
+	}
+
+	// Issue a leaf and verify it against the chain the ca subcommand returned.
+	_, issued, stderr := runCertmanager(t, bin,
+		commonName,
+		"--alt-names", shortName+","+altName,
+		"--ip-sans", ipSAN1+","+ipSAN2,
+		"--expiry-days", fmt.Sprint(expiryDays),
+		"--json",
+	)
+	var doc map[string]string
+	if err := json.Unmarshal([]byte(issued), &doc); err != nil {
+		t.Fatalf("issue stdout is not JSON: %v (stderr %q)", err, stderr)
+	}
+	leaf := parseCert(t, doc["certificate"])
+
+	if err := leaf.CheckSignatureFrom(intermediate); err != nil {
+		t.Errorf("chain[0] did not sign the issued leaf: %v", err)
+	}
+
+	// The openssl verify equivalent: anchor on the root, bridge with the
+	// intermediate, both taken from the ca output alone.
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	inters := x509.NewCertPool()
+	inters.AddCert(intermediate)
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: inters,
+		DNSName:       commonName,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}); err != nil {
+		t.Errorf("leaf does not validate against the ca chain: %v", err)
+	}
+}
+
+// The CA chain endpoint is public, so a config with no auth keys must work.
+func TestCAChainNeedsNoCredentials(t *testing.T) {
+	waitForVault(t)
+	roleID := setupVault(t)
+
+	dir := t.TempDir()
+	bin := buildBinary(t, dir, writeConfig(t, dir, roleID))
+
+	authless := filepath.Join(dir, "authless.yaml")
+	body := fmt.Sprintf("vault:\n  addr: %s\n  mount_point: %s\n", vaultAddr(), pkiMount)
+	if err := os.WriteFile(authless, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	code, stdout, stderr := runCertmanager(t, bin, "ca", "--config", authless)
+	if code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr)
+	}
+	if stderr != "" {
+		t.Errorf("stderr must be empty on success, got %q", stderr)
+	}
+	if len(parseChain(t, stdout)) != 2 {
+		t.Errorf("credential-free ca output is not the two certificate chain: %q", stdout)
+	}
+}
+
+func TestCAChainFailsCleanlyForAnUnknownMount(t *testing.T) {
+	waitForVault(t)
+	roleID := setupVault(t)
+
+	dir := t.TempDir()
+	bin := buildBinary(t, dir, writeConfig(t, dir, roleID))
+
+	code, stdout, stderr := runCertmanager(t, bin, "ca", "--mount", "pki_does_not_exist")
+	if code == 0 {
+		t.Fatalf("expected a non-zero exit, stdout: %s", stdout)
+	}
+	if stdout != "" {
+		t.Errorf("stdout must be empty on failure, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "certmanager:") {
+		t.Errorf("stderr should carry the cause, got %q", stderr)
+	}
+}
+
+func keysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func parseChain(t *testing.T, data string) []*x509.Certificate {
+	t.Helper()
+	var out []*x509.Certificate
+	rest := []byte(data)
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return out
+		}
+		if block.Type != "CERTIFICATE" {
+			t.Fatalf("PEM block %d is a %q", len(out)+1, block.Type)
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("parse certificate %d: %v", len(out)+1, err)
+		}
+		out = append(out, cert)
 	}
 }
 
