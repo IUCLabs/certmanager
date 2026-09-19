@@ -3,9 +3,16 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,6 +34,12 @@ type stubOptions struct {
 	k8sStatus     int
 	issueStatus   int
 	issueDelay    time.Duration
+
+	caStatus int
+	// caBody overrides the CA chain response; caBodySet distinguishes an
+	// intentional empty body from "unset".
+	caBody    string
+	caBodySet bool
 }
 
 type capture struct {
@@ -34,11 +47,50 @@ type capture struct {
 	authBody  map[string]any
 	issueBody map[string]any
 	token     string
+
+	caPath      string
+	caRequested bool
+	// caToken records the header verbatim; the CA endpoint must be called
+	// without one.
+	caToken    string
+	caTokenSet bool
+	// chain is the PEM the stub serves from /ca_chain.
+	chain string
+}
+
+// caChainPEM is a real two certificate PEM chain, since the ca path parses what
+// Vault returns rather than trusting the content type.
+func caChainPEM(t *testing.T) string {
+	t.Helper()
+	return selfSignedPEM(t, "test intermediate") + selfSignedPEM(t, "test root")
+}
+
+func selfSignedPEM(t *testing.T, cn string) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
 
 func newVaultStub(t *testing.T, opts stubOptions) (*httptest.Server, *capture) {
 	t.Helper()
-	got := &capture{}
+	defaultChain := caChainPEM(t)
+	got := &capture{chain: defaultChain}
 
 	decode := func(r *http.Request) map[string]any {
 		var m map[string]any
@@ -82,6 +134,26 @@ func newVaultStub(t *testing.T, opts stubOptions) (*httptest.Server, *capture) {
 			"issuing_ca":  testCA,
 		}}
 		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("/v1/pki_int/ca_chain", func(w http.ResponseWriter, r *http.Request) {
+		got.caRequested = true
+		got.caPath = r.URL.Path
+		got.caToken = r.Header.Get("X-Vault-Token")
+		_, got.caTokenSet = r.Header["X-Vault-Token"]
+
+		if s := orOK(opts.caStatus); s != http.StatusOK {
+			w.WriteHeader(s)
+			_, _ = fmt.Fprint(w, `{"errors":["unsupported path"]}`)
+			return
+		}
+		body := opts.caBody
+		if !opts.caBodySet {
+			body = defaultChain
+		}
+		// Vault advertises pkix-cert while serving PEM; the stub does too, so
+		// nothing downstream may sniff the content type.
+		w.Header().Set("Content-Type", "application/pkix-cert")
+		_, _ = io.WriteString(w, body)
 	})
 
 	srv := httptest.NewTLSServer(mux)
@@ -140,8 +212,7 @@ func TestRunJSONGolden(t *testing.T) {
 
 	want := `{"certificate":"-----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----",` +
 		`"private_key":"-----BEGIN RSA PRIVATE KEY-----\nKEY\n-----END RSA PRIVATE KEY-----",` +
-		`"full_chain":"-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----",` +
-		`"ca_certificate":"-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----"}` + "\n"
+		`"full_chain":"-----BEGIN CERTIFICATE-----\nLEAF\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----"}` + "\n"
 	if stdout.String() != want {
 		t.Errorf("stdout mismatch\n got: %q\nwant: %q", stdout.String(), want)
 	}
@@ -151,11 +222,18 @@ func TestRunJSONGolden(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
 		t.Fatalf("stdout is not valid JSON: %v", err)
 	}
-	if parsed["ca_certificate"] != testCA {
-		t.Errorf("ca_certificate = %q, want issuing_ca", parsed["ca_certificate"])
+	if _, ok := parsed["ca_certificate"]; ok {
+		t.Error("ca_certificate must not be emitted; the CA comes from the ca subcommand")
 	}
-	if parsed["full_chain"] != testCA+"\n"+testCert {
-		t.Errorf("full_chain = %q", parsed["full_chain"])
+	if len(parsed) != 3 {
+		t.Errorf("document has %d keys, want exactly 3: %v", len(parsed), parsed)
+	}
+	// Leaf first, issuer after -- asserted as an ordering, not a membership.
+	if parsed["full_chain"] != testCert+"\n"+testCA {
+		t.Errorf("full_chain = %q, want leaf then issuing CA", parsed["full_chain"])
+	}
+	if strings.Index(parsed["full_chain"], "LEAF") > strings.Index(parsed["full_chain"], "\nCA\n") {
+		t.Errorf("full_chain puts the CA ahead of the leaf: %q", parsed["full_chain"])
 	}
 
 	if got.token != "s.testtoken" {
@@ -357,10 +435,12 @@ func TestRunWritesFiles(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"certificate.crt":    testCert,
-		"private.key":        testKey,
-		"full_chain.crt":     testCA + "\n" + testCert,
-		"ca_certificate.crt": testCA,
+		"certificate.crt": testCert,
+		"private.key":     testKey,
+		"full_chain.crt":  testCert + "\n" + testCA,
+	}
+	if _, err := os.Stat(filepath.Join(out, "host.example.com", "ca_certificate.crt")); !os.IsNotExist(err) {
+		t.Errorf("ca_certificate.crt must no longer be written by the issue path (stat err = %v)", err)
 	}
 	for name, body := range want {
 		got, err := os.ReadFile(filepath.Join(out, "host.example.com", name))
@@ -401,7 +481,7 @@ func TestRunCompress(t *testing.T) {
 	for _, f := range zr.File {
 		names = append(names, f.Name)
 	}
-	wantNames := []string{"certificate.crt", "private.key", "full_chain.crt", "ca_certificate.crt"}
+	wantNames := []string{"certificate.crt", "private.key", "full_chain.crt"}
 	if !reflect.DeepEqual(names, wantNames) {
 		t.Errorf("zip entries = %v, want %v", names, wantNames)
 	}
@@ -444,6 +524,244 @@ func TestCompletionSubcommand(t *testing.T) {
 			}
 			if stdout.Len() == 0 {
 				t.Error("completion script is empty")
+			}
+		})
+	}
+}
+
+// authlessConfig carries only addr and mount_point: the CA chain endpoint is
+// public, so the ca subcommand must not need auth keys to be present.
+func authlessConfig(t *testing.T, addr string) string {
+	t.Helper()
+	return writeConfig(t, "vault:\n"+
+		"  addr: "+addr+"\n"+
+		"  mount_point: pki_int\n")
+}
+
+func TestRunCAPrintsChain(t *testing.T) {
+	srv, got := newVaultStub(t, stubOptions{})
+	cfg := authlessConfig(t, srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ca", "--config", cfg}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+
+	if got.caPath != "/v1/pki_int/ca_chain" {
+		t.Errorf("requested path = %q, want /v1/pki_int/ca_chain", got.caPath)
+	}
+	// Unauthenticated: the header must be absent, not merely empty.
+	if got.caTokenSet {
+		t.Errorf("X-Vault-Token must not be sent to the CA endpoint, got %q", got.caToken)
+	}
+	if got.issueBody != nil {
+		t.Error("the ca subcommand must not issue a certificate")
+	}
+
+	want := strings.TrimSpace(got.chain) + "\n"
+	if stdout.String() != want {
+		t.Errorf("stdout = %q, want the PEM chain %q", stdout.String(), want)
+	}
+	if n := strings.Count(stdout.String(), "-----BEGIN CERTIFICATE-----"); n != 2 {
+		t.Errorf("stdout carries %d certificates, want 2", n)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// "ca" is the subcommand, never a common name to issue for.
+func TestRunCAIsNotTreatedAsACommonName(t *testing.T) {
+	srv, got := newVaultStub(t, stubOptions{})
+	cfg := approleConfig(t, srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ca", "--config", cfg}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if !got.caRequested {
+		t.Error("the CA chain endpoint was never called")
+	}
+	if got.issueBody != nil {
+		t.Errorf("issuance was attempted for common name %v", got.issueBody["common_name"])
+	}
+	if got.authPath != "" {
+		t.Errorf("the ca subcommand logged in at %q; it must not authenticate", got.authPath)
+	}
+}
+
+// The positional issue form must keep parsing unchanged now that a subcommand
+// sits alongside it.
+func TestRunPositionalFormStillParses(t *testing.T) {
+	srv, got := newVaultStub(t, stubOptions{})
+	cfg := approleConfig(t, srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	if code := run(puppetArgs(cfg), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if got.issueBody["common_name"] != "host.example.com" {
+		t.Errorf("common_name = %v", got.issueBody["common_name"])
+	}
+	if got.caRequested {
+		t.Error("the issue path must not call the CA chain endpoint")
+	}
+}
+
+func TestRunCAMountFlagOverridesConfig(t *testing.T) {
+	srv, got := newVaultStub(t, stubOptions{})
+	cfg := writeConfig(t, "vault:\n  addr: "+srv.URL+"\n")
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ca", "--config", cfg, "--mount", "pki_int"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if got.caPath != "/v1/pki_int/ca_chain" {
+		t.Errorf("requested path = %q", got.caPath)
+	}
+}
+
+func TestRunCASuccessWritesNothingToStderr(t *testing.T) {
+	srv, _ := newVaultStub(t, stubOptions{})
+	cfg := authlessConfig(t, srv.URL)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+
+	var stdout bytes.Buffer
+	code := run([]string{"ca", "--config", cfg}, &stdout, os.Stderr)
+
+	os.Stderr = orig
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	captured, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read pipe: %v", err)
+	}
+
+	if code != 0 {
+		t.Fatalf("exit code = %d", code)
+	}
+	if len(captured) != 0 {
+		t.Errorf("stderr must be byte-empty on the ca success path, got %q", captured)
+	}
+	if stdout.Len() == 0 {
+		t.Error("stdout is empty")
+	}
+}
+
+func TestRunCAFailures(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    stubOptions
+		config  func(t *testing.T, addr string) string
+		args    func(cfg string) []string
+		wantErr string
+	}{
+		{
+			name:    "vault rejects the request",
+			opts:    stubOptions{caStatus: http.StatusForbidden},
+			config:  authlessConfig,
+			wantErr: "vault returned 403",
+		},
+		{
+			name:    "mount does not exist",
+			opts:    stubOptions{caStatus: http.StatusNotFound},
+			config:  authlessConfig,
+			wantErr: "vault returned 404",
+		},
+		{
+			name:    "empty body",
+			opts:    stubOptions{caBody: "", caBodySet: true},
+			config:  authlessConfig,
+			wantErr: "empty CA chain",
+		},
+		{
+			name:    "whitespace only body",
+			opts:    stubOptions{caBody: "\n  \n", caBodySet: true},
+			config:  authlessConfig,
+			wantErr: "empty CA chain",
+		},
+		{
+			name:    "body is not PEM",
+			opts:    stubOptions{caBody: "<html>nope</html>", caBodySet: true},
+			config:  authlessConfig,
+			wantErr: "not a PEM certificate chain",
+		},
+		{
+			name:    "PEM block is not a certificate",
+			opts:    stubOptions{caBody: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n", caBodySet: true},
+			config:  authlessConfig,
+			wantErr: `not a CERTIFICATE`,
+		},
+		{
+			name:    "PEM certificate is corrupt",
+			opts:    stubOptions{caBody: "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", caBodySet: true},
+			config:  authlessConfig,
+			wantErr: "parse certificate 1",
+		},
+		{
+			name: "missing config file",
+			config: func(t *testing.T, _ string) string {
+				return filepath.Join(t.TempDir(), "nope.yaml")
+			},
+			wantErr: "open config",
+		},
+		{
+			name: "config without addr",
+			config: func(t *testing.T, _ string) string {
+				return writeConfig(t, "vault:\n  mount_point: pki_int\n")
+			},
+			wantErr: "vault.addr is required",
+		},
+		{
+			name: "no mount anywhere",
+			config: func(t *testing.T, addr string) string {
+				return writeConfig(t, "vault:\n  addr: "+addr+"\n")
+			},
+			wantErr: "vault.mount_point is required",
+		},
+		{
+			name:    "vault is unreachable",
+			config:  func(t *testing.T, _ string) string { return authlessConfig(t, "https://127.0.0.1:1") },
+			wantErr: "GET pki_int/ca_chain",
+		},
+		{
+			name: "ca takes no positional arguments",
+			config: func(t *testing.T, addr string) string {
+				return authlessConfig(t, addr)
+			},
+			args:    func(cfg string) []string { return []string{"ca", "extra", "--config", cfg} },
+			wantErr: "unknown command",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := newVaultStub(t, tc.opts)
+			cfg := tc.config(t, srv.URL)
+			args := []string{"ca", "--config", cfg}
+			if tc.args != nil {
+				args = tc.args(cfg)
+			}
+
+			var stdout, stderr bytes.Buffer
+			code := run(args, &stdout, &stderr)
+
+			if code == 0 {
+				t.Fatalf("exit code = 0, want non-zero (stdout %q)", stdout.String())
+			}
+			// A half-written PEM would be spliced into the catalog.
+			if stdout.Len() != 0 {
+				t.Errorf("stdout must stay empty on failure, got %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantErr) {
+				t.Errorf("stderr = %q, want it to mention %q", stderr.String(), tc.wantErr)
 			}
 		})
 	}

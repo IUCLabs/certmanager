@@ -79,12 +79,63 @@ func rootCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&cfgFile, "config", config.DefaultPath(), "path to config.yaml")
+	// Persistent so the ca subcommand shares it; the positional form keeps
+	// parsing --config exactly as before.
+	cmd.PersistentFlags().StringVar(&cfgFile, "config", config.DefaultPath(), "path to config.yaml")
 	cmd.Flags().StringVarP(&altNames, "alt-names", "a", "", "comma-separated DNS subject alternative names")
 	cmd.Flags().StringVarP(&ipSans, "ip-sans", "i", "", "comma-separated IP subject alternative names")
 	cmd.Flags().IntVarP(&expiryDays, "expiry-days", "e", 365, "certificate validity in days")
 	cmd.Flags().BoolVarP(&compress, "compress", "c", false, "write the certificate, key and chain into a zip file")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "print the certificate data as JSON instead of writing files")
+
+	cmd.AddCommand(caCmd(&cfgFile))
+
+	return cmd
+}
+
+// caCmd prints the mount's CA chain. Distributing the CA this way decouples it
+// from certificate issuance, so a CA rotation reaches every node on the next
+// catalog compile instead of waiting out a 90 day renewal cycle.
+func caCmd(cfgFile *string) *cobra.Command {
+	var mount string
+
+	cmd := &cobra.Command{
+		Use:           "ca",
+		Short:         "Print the PKI mount's CA chain (intermediate and root) as PEM",
+		Args:          cobra.NoArgs,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := config.LoadCA(*cfgFile)
+			if err != nil {
+				return err
+			}
+
+			mountPoint := cfg.Vault.MountPoint
+			if mount != "" {
+				mountPoint = mount
+			}
+			if mountPoint == "" {
+				return fmt.Errorf("vault.mount_point is required (or pass --mount)")
+			}
+
+			client, err := vault.NewUnauthenticated(cfg.Vault)
+			if err != nil {
+				return err
+			}
+
+			// The chain is fully validated before a byte reaches stdout: a
+			// half-written document would break the catalog compile.
+			chain, err := pki.FetchCAChain(client, mountPoint)
+			if err != nil {
+				return err
+			}
+			_, err = io.WriteString(cmd.OutOrStdout(), chain)
+			return err
+		},
+	}
+
+	cmd.Flags().StringVarP(&mount, "mount", "m", "", "PKI mount to read (default: vault.mount_point)")
 
 	return cmd
 }
@@ -123,7 +174,6 @@ func writeFiles(outputPath, commonName string, compress bool, cert *pki.Certific
 		{"certificate.crt", cert.Certificate, 0o644},
 		{"private.key", cert.PrivateKey, 0o600},
 		{"full_chain.crt", cert.FullChain, 0o644},
-		{"ca_certificate.crt", cert.CACertificate, 0o644},
 	}
 
 	if compress {

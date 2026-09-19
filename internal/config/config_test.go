@@ -125,3 +125,63 @@ func TestDefaultPath(t *testing.T) {
 		t.Errorf("DefaultPath() = %q, want the Puppet-managed path", got)
 	}
 }
+
+// The CA chain endpoint is unauthenticated, so a config with nothing but addr
+// and mount_point has to load.
+func TestLoadCAWithoutCredentials(t *testing.T) {
+	cfg, err := LoadCA(writeConfig(t, "vault:\n  addr: https://vault.example.com:8200\n  mount_point: pki_int\n"))
+	if err != nil {
+		t.Fatalf("LoadCA: %v", err)
+	}
+	if cfg.Vault.Addr != "https://vault.example.com:8200" {
+		t.Errorf("addr = %q", cfg.Vault.Addr)
+	}
+	if cfg.Vault.MountPoint != "pki_int" {
+		t.Errorf("mount_point = %q", cfg.Vault.MountPoint)
+	}
+	if cfg.Vault.RoleID != "" || cfg.Vault.RoleName != "" {
+		t.Errorf("LoadCA invented credentials: %+v", cfg.Vault)
+	}
+}
+
+// Load, by contrast, still demands everything issuance needs.
+func TestLoadRejectsWhatLoadCAAccepts(t *testing.T) {
+	path := writeConfig(t, "vault:\n  addr: https://vault.example.com:8200\n  mount_point: pki_int\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted a config with no role_name or credentials")
+	}
+}
+
+func TestLoadCAErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{"no addr", "vault:\n  mount_point: pki_int\n", "vault.addr is required"},
+		{"bad timeout", "vault:\n  addr: https://v:8200\n  timeout: soon\n", "not a valid duration"},
+		{"negative timeout", "vault:\n  addr: https://v:8200\n  timeout: -5s\n", "must be positive"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadCA(writeConfig(t, tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadCAMissingFile(t *testing.T) {
+	_, err := LoadCA(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err == nil || !strings.Contains(err.Error(), "open config") {
+		t.Errorf("error = %v, want an open failure", err)
+	}
+}
+
+// An unknown auth_method is fatal for issuance but irrelevant to the CA path.
+func TestLoadCAIgnoresAuthMethod(t *testing.T) {
+	if _, err := LoadCA(writeConfig(t, "vault:\n  addr: https://v:8200\n  auth_method: ldap\n  mount_point: pki_int\n")); err != nil {
+		t.Errorf("LoadCA: %v", err)
+	}
+}
