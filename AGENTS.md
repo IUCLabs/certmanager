@@ -29,14 +29,15 @@ than a clean failure. Two rules follow:
 ```
 cmd/certmanager/main.go       # CLI (flattened: the positional arg is the command)
 cmd/certmanager/main_test.go  # end-to-end tests against an httptest Vault stub
+test/integration/             # end-to-end tests against a real Vault dev server
 internal/config/              # YAML config: parsing, defaults, validation
 internal/pki/                 # issue request/response + the JSON output shape
 internal/vault/               # authenticated HTTP client (approle, kubernetes)
-Makefile                      # build / test / lint / completions / rpm / version bump
-packaging/nfpm.yaml           # nfpm spec (envsubst-templated) for the RPM
-scripts/build-rpm.sh          # generates completions + packages the RPM
-.woodpecker/                  # CI: build, test, pre-commit (PR) + release (tag)
-dist/                         # build output: binary, completions, RPM (not committed)
+Makefile                      # build / test / lint / completions / version bump
+.goreleaser.yaml              # single release driver: binaries + RPM + Gitea release
+scripts/integration-test.sh   # runs the integration test against a Vault dev server
+.woodpecker/                  # CI: build, test, integration, pre-commit (PR) + release (tag)
+dist/                         # build output: binaries, RPM, checksums (not committed)
 ```
 
 ## Code Patterns
@@ -73,14 +74,22 @@ dist/                         # build output: binary, completions, RPM (not comm
 ## Testing
 
 ```bash
-make test           # go test -v -race ./...
+make test              # go test -v -race ./...
+make integration-test  # -tags=integration, against a real Vault dev server
 ```
 
-Vault is stubbed with `httptest.NewTLSServer` — no live Vault is required.
+Unit tests stub Vault with `httptest.NewTLSServer` — no live Vault is required.
 Coverage: the golden `--json` stdout document, stderr emptiness on success,
 rejected logins for both auth methods, missing/empty JWT, unknown
 `auth_method`, a non-200 issue response, request timeout, TLS verification when
 enabled, file and zip output, and the comma-list parsing table.
+
+`test/integration` (build tag `integration`) provisions a real PKI mount,
+policy and `bind_secret_id: false` approle role on a Vault dev server, then
+runs the binary with Puppet's argv and asserts exit code, empty stderr, the
+four JSON keys, the parsed X.509 CN/SANs/lifetime, and that a refused name
+exits non-zero with empty stdout. Dev mode is plain HTTP, so it does not
+exercise the TLS path.
 
 ## Gotchas
 

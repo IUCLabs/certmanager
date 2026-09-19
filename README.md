@@ -108,11 +108,28 @@ make build        # -> dist/certmanager (CGO disabled, static)
 make test         # go test -v -race ./...
 make lint         # golangci-lint
 make pre-commit   # uvx pre-commit run --all-files
-make completions  # -> dist/completions/
-make rpm          # build + package into dist/*.rpm via nfpm
+make completions       # -> dist/completions/
+make integration-test  # end-to-end against a real Vault dev server
+make release-snapshot  # goreleaser: binaries, tar.gz and RPM into dist/
 ```
 
-The RPM installs `/usr/bin/certmanager`, symlinks `/usr/local/bin/certmanager`
-(the path Puppet calls), and ships bash/zsh/fish completions. On a `v*` tag the
-release pipeline builds the RPM and `PUT`s it to the artifactapi `rpm-internal`
-repo.
+`make integration-test` starts a `hashicorp/vault` dev container with
+docker/podman, provisions a PKI mount and an approle role, then runs the built
+binary with the exact argv Puppet uses and asserts on the issued certificate.
+Point it at an existing dev server with `CERTMANAGER_IT_VAULT_ADDR`
+(`VAULT_ADDR` is deliberately ignored — the test writes to the PKI mount).
+
+## Releasing
+
+goreleaser drives the whole release from a `v*` tag:
+
+- raw binaries `certmanager-<os>-<arch>` (linux/darwin, amd64/arm64) attached to
+  the Gitea release — the puppetserver-compiler initContainer fetches one file
+  by URL and checksums it, so it cannot unpack an archive;
+- `tar.gz` archives and `checksums.txt`;
+- `certmanager-<version>-1.<arch>.rpm`, installing `/usr/bin/certmanager`,
+  symlinking `/usr/local/bin/certmanager` (the path Puppet calls) and shipping
+  bash/zsh/fish completions.
+
+The release pipeline then `PUT`s the RPM to the artifactapi `rpm-internal`
+repo, which goreleaser cannot do itself.

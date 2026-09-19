@@ -1,0 +1,41 @@
+when:
+  - event: pull_request
+
+# Vault dev mode serves plain HTTP on 8200 with a known root token; the image's
+# default command is already `server -dev`.
+services:
+  - name: vault
+    image: hashicorp/vault:1.21
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    backend_options:
+      kubernetes:
+        serviceAccountName: default
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 1
+          limits:
+            memory: 2Gi
+            cpu: 2
+
+steps:
+  # End-to-end: real PKI mount, real approle login, real issuance, asserted
+  # against the exact argv Puppet's generate() uses.
+  - name: integration
+    image: golang:1.25
+    environment:
+      CERTMANAGER_IT_VAULT_ADDR: http://vault:8200
+    commands:
+      - make integration-test
+    backend_options:
+      kubernetes:
+        serviceAccountName: default
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 1
+          limits:
+            memory: 2Gi
+            cpu: 2

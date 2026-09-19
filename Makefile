@@ -10,7 +10,7 @@ GOFLAGS := -trimpath -ldflags="-s -w -X main.version=$(VERSION) -X $(CONFIG_PKG)
 OS      ?= $(shell go env GOOS)
 ARCH    ?= $(shell go env GOARCH)
 
-.PHONY: all build test lint fmt pre-commit clean install completions rpm rpm-package patch minor major _tag
+.PHONY: all build test integration-test lint fmt pre-commit clean install completions release-snapshot patch minor major _tag
 
 all: build
 
@@ -19,6 +19,11 @@ build:
 
 test:
 	go test -v -race ./...
+
+# End-to-end test against a real Vault dev server (docker/podman locally, the
+# Woodpecker `vault` service in CI). Set VAULT_ADDR to use an existing server.
+integration-test:
+	./scripts/integration-test.sh
 
 lint:
 	golangci-lint run ./...
@@ -42,12 +47,10 @@ completions: build
 	$(DIST)/$(BINARY) completion zsh  > $(DIST)/completions/_$(BINARY)
 	$(DIST)/$(BINARY) completion fish > $(DIST)/completions/$(BINARY).fish
 
-# Build the binary then package it (with completions) into an RPM via nfpm.
-rpm: build rpm-package
-
-# Package an already-built binary into an RPM (used by CI after the build step).
-rpm-package:
-	./scripts/build-rpm.sh $(VERSION)
+# Build every release artifact (binaries, tar.gz, RPM) locally without
+# publishing. goreleaser is the single driver for the tagged release too.
+release-snapshot:
+	goreleaser release --snapshot --clean
 
 # Bump helpers — read the latest semver tag and create the next one.
 _LATEST := $(shell git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$$' | head -1)

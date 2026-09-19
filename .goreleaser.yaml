@@ -1,0 +1,102 @@
+version: 2
+
+project_name: certmanager
+
+before:
+  hooks:
+    # goreleaser refuses to release from a dirty tree, so nothing here may
+    # touch tracked files; completions/ is gitignored.
+    - mkdir -p completions
+    - sh -c "go run ./cmd/certmanager completion bash > completions/certmanager.bash"
+    - sh -c "go run ./cmd/certmanager completion zsh  > completions/_certmanager"
+    - sh -c "go run ./cmd/certmanager completion fish > completions/certmanager.fish"
+
+builds:
+  - id: certmanager
+    main: ./cmd/certmanager
+    binary: certmanager
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      # Puppet writes the config to /opt/certmanager/config.yaml.
+      - -s -w -X main.version={{ .Version }} -X github.com/IUCLabs/certmanager/internal/config.defaultPath=/opt/certmanager/config.yaml
+
+archives:
+  # Raw binaries: the puppetserver-compiler initContainer fetches a single
+  # pinned file by URL and checksums it, so it cannot unpack an archive.
+  - id: binaries
+    ids: [certmanager]
+    formats: [binary]
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+  - id: archives
+    ids: [certmanager]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - completions/*
+
+nfpms:
+  - id: certmanager
+    ids: [certmanager]
+    package_name: certmanager
+    # certmanager-<version>-1.x86_64.rpm, matching the previous nfpm output.
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: myorg
+    homepage: https://github.com/IUCLabs/certmanager
+    maintainer: Ben Vincent <12552114+neoloc@users.noreply.github.com>
+    description: Issues Vault PKI certificates for Puppet-managed nodes; drop-in replacement for the Python certmanager script
+    license: MIT
+    formats:
+      - rpm
+    release: "1"
+    bindir: /usr/bin
+    provides:
+      - certmanager
+    replaces:
+      - certmanager
+    contents:
+      # Puppet's profiles::pki::vault calls the binary at this hardcoded path.
+      - src: /usr/bin/certmanager
+        dst: /usr/local/bin/certmanager
+        type: symlink
+      - src: completions/certmanager.bash
+        dst: /usr/share/bash-completion/completions/certmanager
+        file_info:
+          mode: 0644
+      - src: completions/_certmanager
+        dst: /usr/share/zsh/site-functions/_certmanager
+        file_info:
+          mode: 0644
+      - src: completions/certmanager.fish
+        dst: /usr/share/fish/vendor_completions.d/certmanager.fish
+        file_info:
+          mode: 0644
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  gitea:
+    owner: myorg
+    name: certmanager
+
+gitea_urls:
+  api: https://git.example.com/api/v1
+  download: https://git.example.com
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
