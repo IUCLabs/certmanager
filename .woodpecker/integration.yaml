@@ -1,34 +1,32 @@
 when:
   - event: pull_request
 
-# Vault dev mode serves plain HTTP on 8200 with a known root token; the image's
-# default command is already `server -dev`.
-services:
-  - name: vault
-    image: hashicorp/vault:1.21
-    environment:
-      VAULT_DEV_ROOT_TOKEN_ID: root
-      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
-    backend_options:
-      kubernetes:
-        serviceAccountName: default
-        resources:
-          requests:
-            memory: 512Mi
-            cpu: 1
-          limits:
-            memory: 2Gi
-            cpu: 2
-
+# Kept out of test.yaml so the three required PR contexts (build/test/pre-commit)
+# stay exactly what they were; this one needs a Vault next to it.
 steps:
   # End-to-end: real PKI mount, real approle login, real issuance, asserted
   # against the exact argv Puppet's generate() uses.
   - name: integration
     image: golang:1.25
     environment:
-      CERTMANAGER_IT_VAULT_ADDR: http://vault:8200
+      VAULT_VERSION: 1.20.4
+      VAULT_SHA256: fc5fb5d01d192f1216b139fb5c6af17e3af742aaeffc289fd861920ec55f2c9c
+      CERTMANAGER_IT_VAULT_ADDR: http://127.0.0.1:8200
+      # Throwaway dev-mode server on loopback; this token grants nothing.
+      CERTMANAGER_IT_VAULT_TOKEN: dev-root-token
     commands:
-      - make integration-test
+      # A long-running Vault as its own step or service wedges the workflow on
+      # the kubernetes backend, so the server runs inside this step. The golang
+      # image does not trust the estate's internal CA, so artifactapi is fetched
+      # over http and the archive is pinned by checksum instead.
+      - curl -fsSL -o /tmp/vault.zip "http://artifactapi.example.com/api/v1/remote/hashicorp-releases/vault/$${VAULT_VERSION}/vault_$${VAULT_VERSION}_linux_amd64.zip"
+      - echo "$${VAULT_SHA256}  /tmp/vault.zip" | sha256sum -c -
+      - python3 -m zipfile -e /tmp/vault.zip /usr/local/bin/
+      - chmod +x /usr/local/bin/vault
+      # Dev mode serves plain HTTP; the test polls /v1/sys/health rather than
+      # sleeping, and the timeout keeps a wedged server from pinning an agent.
+      - vault server -dev -dev-root-token-id="$${CERTMANAGER_IT_VAULT_TOKEN}" -dev-listen-address=127.0.0.1:8200 >/tmp/vault.log 2>&1 &
+      - timeout 600 make integration-test
     backend_options:
       kubernetes:
         serviceAccountName: default
