@@ -531,11 +531,12 @@ func TestCompletionSubcommand(t *testing.T) {
 
 // authlessConfig carries only addr and mount_point: the CA chain endpoint is
 // public, so the ca subcommand must not need auth keys to be present.
-func authlessConfig(t *testing.T, addr string) string {
+func authlessConfig(t *testing.T, addr string, extra ...string) string {
 	t.Helper()
 	return writeConfig(t, "vault:\n"+
 		"  addr: "+addr+"\n"+
-		"  mount_point: pki_int\n")
+		"  mount_point: pki_int\n"+
+		strings.Join(extra, ""))
 }
 
 func TestRunCAPrintsChain(t *testing.T) {
@@ -666,43 +667,43 @@ func TestRunCAFailures(t *testing.T) {
 		{
 			name:    "vault rejects the request",
 			opts:    stubOptions{caStatus: http.StatusForbidden},
-			config:  authlessConfig,
+			config:  func(t *testing.T, addr string) string { return authlessConfig(t, addr) },
 			wantErr: "vault returned 403",
 		},
 		{
 			name:    "mount does not exist",
 			opts:    stubOptions{caStatus: http.StatusNotFound},
-			config:  authlessConfig,
+			config:  func(t *testing.T, addr string) string { return authlessConfig(t, addr) },
 			wantErr: "vault returned 404",
 		},
 		{
 			name:    "empty body",
 			opts:    stubOptions{caBody: "", caBodySet: true},
-			config:  authlessConfig,
+			config:  func(t *testing.T, addr string) string { return authlessConfig(t, addr) },
 			wantErr: "empty CA chain",
 		},
 		{
 			name:    "whitespace only body",
 			opts:    stubOptions{caBody: "\n  \n", caBodySet: true},
-			config:  authlessConfig,
+			config:  func(t *testing.T, addr string) string { return authlessConfig(t, addr) },
 			wantErr: "empty CA chain",
 		},
 		{
 			name:    "body is not PEM",
 			opts:    stubOptions{caBody: "<html>nope</html>", caBodySet: true},
-			config:  authlessConfig,
+			config:  func(t *testing.T, addr string) string { return authlessConfig(t, addr) },
 			wantErr: "not a PEM certificate chain",
 		},
 		{
 			name:    "PEM block is not a certificate",
 			opts:    stubOptions{caBody: "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n", caBodySet: true},
-			config:  authlessConfig,
+			config:  func(t *testing.T, addr string) string { return authlessConfig(t, addr) },
 			wantErr: `not a CERTIFICATE`,
 		},
 		{
 			name:    "PEM certificate is corrupt",
 			opts:    stubOptions{caBody: "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", caBodySet: true},
-			config:  authlessConfig,
+			config:  func(t *testing.T, addr string) string { return authlessConfig(t, addr) },
 			wantErr: "parse certificate 1",
 		},
 		{
@@ -727,8 +728,10 @@ func TestRunCAFailures(t *testing.T) {
 			wantErr: "vault.mount_point is required",
 		},
 		{
-			name:    "vault is unreachable",
-			config:  func(t *testing.T, _ string) string { return authlessConfig(t, "https://127.0.0.1:1") },
+			name: "vault is unreachable",
+			config: func(t *testing.T, _ string) string {
+				return authlessConfig(t, "https://127.0.0.1:1", "  timeout: 200ms\n")
+			},
 			wantErr: "GET pki_int/ca_chain",
 		},
 		{
