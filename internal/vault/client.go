@@ -2,16 +2,20 @@ package vault
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/IUCLabs/certmanager/internal/config"
 )
 
-const defaultKubernetesTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+// maxErrorBody caps how much of a Vault error response is quoted back.
+const maxErrorBody = 2048
 
 // Client is an authenticated Vault HTTP client.
 type Client struct {
@@ -20,53 +24,45 @@ type Client struct {
 	http  *http.Client
 }
 
-// New authenticates to Vault using the method specified in cfg and returns a
-// ready Client.
+// New authenticates to Vault using the method named in cfg and returns a ready
+// Client. An unknown method, or a failure of the selected method, is an error:
+// there is no fallback between methods.
 func New(cfg config.VaultConfig) (*Client, error) {
-	// TLS verification is intentionally skipped to match the existing Python
-	// scripts; the TODO comment in those scripts notes this should be removed
-	// once certs are generated everywhere.
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-	}
-	httpClient := &http.Client{Transport: transport}
-
-	c := &Client{addr: cfg.Addr, http: httpClient}
-
-	var err error
-	switch cfg.AuthMethod {
-	case config.AuthMethodAppRole, "":
-		err = c.loginAppRole(cfg)
-	case config.AuthMethodLDAP:
-		err = c.loginLDAP(cfg)
-	case config.AuthMethodKubernetes:
-		err = c.loginKubernetes(cfg)
-	case config.AuthMethodToken:
-		err = c.loginToken(cfg)
-	default:
-		return nil, fmt.Errorf("unknown auth_method %q (valid: approle, ldap, kubernetes, token)", cfg.AuthMethod)
-	}
+	timeout, err := cfg.RequestTimeout()
 	if err != nil {
 		return nil, err
 	}
 
+	transport := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: cfg.SkipTLSVerify()}, //nolint:gosec // defaults to the Python script's verify=False; flip vault.tls_skip_verify to enable
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+	}
+
+	c := &Client{
+		addr: strings.TrimRight(cfg.Addr, "/"),
+		http: &http.Client{Transport: transport, Timeout: timeout},
+	}
+
+	switch cfg.AuthMethod {
+	case config.AuthMethodAppRole:
+		err = c.loginAppRole(cfg)
+	case config.AuthMethodKubernetes:
+		err = c.loginKubernetes(cfg)
+	default:
+		return nil, fmt.Errorf("unknown vault.auth_method %q (valid: %s, %s)",
+			cfg.AuthMethod, config.AuthMethodAppRole, config.AuthMethodKubernetes)
+	}
+	if err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
-// ---------------------------------------------------------------------------
-// auth method implementations
-// ---------------------------------------------------------------------------
-
 func (c *Client) loginAppRole(cfg config.VaultConfig) error {
-	path := cfg.ApprolePath
-	if path == "" {
-		path = "approle"
-	}
+	// The Vault role sets bind_secret_id: false, so role_id alone logs in.
 	payload := map[string]string{"role_id": cfg.RoleID}
-	if cfg.SecretID != "" {
-		payload["secret_id"] = cfg.SecretID
-	}
-	token, err := c.fetchToken(fmt.Sprintf("auth/%s/login", path), payload)
+	token, err := c.fetchToken(fmt.Sprintf("auth/%s/login", cfg.ApprolePath), payload)
 	if err != nil {
 		return fmt.Errorf("approle login: %w", err)
 	}
@@ -74,38 +70,18 @@ func (c *Client) loginAppRole(cfg config.VaultConfig) error {
 	return nil
 }
 
-func (c *Client) loginLDAP(cfg config.VaultConfig) error {
-	path := cfg.LDAPPath
-	if path == "" {
-		path = "ldap"
-	}
-	payload := map[string]string{"password": cfg.LDAPPassword}
-	token, err := c.fetchToken(fmt.Sprintf("auth/%s/login/%s", path, cfg.LDAPUsername), payload)
-	if err != nil {
-		return fmt.Errorf("ldap login: %w", err)
-	}
-	c.token = token
-	return nil
-}
-
 func (c *Client) loginKubernetes(cfg config.VaultConfig) error {
-	path := cfg.KubernetesPath
-	if path == "" {
-		path = "kubernetes"
-	}
-	tokenFile := cfg.KubernetesTokenFile
-	if tokenFile == "" {
-		tokenFile = defaultKubernetesTokenFile
-	}
-	jwt, err := os.ReadFile(tokenFile)
+	raw, err := os.ReadFile(cfg.JWTPath)
 	if err != nil {
-		return fmt.Errorf("kubernetes login: read service account token %q: %w", tokenFile, err)
+		return fmt.Errorf("kubernetes login: read service account token %q: %w", cfg.JWTPath, err)
 	}
-	payload := map[string]string{
-		"role": cfg.KubernetesRole,
-		"jwt":  string(jwt),
+	jwt := strings.TrimSpace(string(raw))
+	if jwt == "" {
+		return fmt.Errorf("kubernetes login: service account token %q is empty", cfg.JWTPath)
 	}
-	token, err := c.fetchToken(fmt.Sprintf("auth/%s/login", path), payload)
+
+	payload := map[string]string{"role": cfg.K8sRole, "jwt": jwt}
+	token, err := c.fetchToken(fmt.Sprintf("auth/%s/login", cfg.K8sMount), payload)
 	if err != nil {
 		return fmt.Errorf("kubernetes login: %w", err)
 	}
@@ -113,74 +89,56 @@ func (c *Client) loginKubernetes(cfg config.VaultConfig) error {
 	return nil
 }
 
-func (c *Client) loginToken(cfg config.VaultConfig) error {
-	if cfg.Token == "" {
-		return fmt.Errorf("token auth: vault.token must not be empty")
-	}
-	c.token = cfg.Token
-	return nil
-}
-
 // fetchToken posts to a Vault auth endpoint and extracts the client token.
 func (c *Client) fetchToken(authPath string, payload any) (string, error) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-
-	url := fmt.Sprintf("%s/v1/%s", c.addr, authPath)
-	resp, err := c.http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
-
 	var result struct {
 		Auth struct {
 			ClientToken string `json:"client_token"`
 		} `json:"auth"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+	if err := c.post(authPath, "", payload, &result); err != nil {
+		return "", err
 	}
 	if result.Auth.ClientToken == "" {
-		return "", fmt.Errorf("empty client token in response")
+		return "", fmt.Errorf("vault returned no auth.client_token")
 	}
 	return result.Auth.ClientToken, nil
 }
 
-// ---------------------------------------------------------------------------
-// request helpers
-// ---------------------------------------------------------------------------
-
 // Post sends an authenticated POST to a Vault path and decodes the response.
 func (c *Client) Post(path string, payload, out any) error {
+	return c.post(path, c.token, payload, out)
+}
+
+func (c *Client) post(path, token string, payload, out any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 
 	url := fmt.Sprintf("%s/v1/%s", c.addr, path)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Vault-Token", c.token)
 	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("X-Vault-Token", token)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("vault POST %s: %w", path, err)
+		return fmt.Errorf("POST %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("vault POST %s: unexpected status %d", path, resp.StatusCode)
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		return fmt.Errorf("POST %s: vault returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(detail)))
 	}
 
-	return json.NewDecoder(resp.Body).Decode(out)
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("POST %s: decode response: %w", path, err)
+	}
+	return nil
 }
