@@ -2,282 +2,260 @@ package vault_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/IUCLabs/certmanager/internal/config"
 	"github.com/IUCLabs/certmanager/internal/vault"
 )
 
-// tokenHandler returns a handler that serves a fixed Vault token on POST.
-func tokenHandler(token string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"auth": map[string]any{"client_token": token},
-		})
-	}
-}
-
-func newTLSServer(t *testing.T, mux *http.ServeMux) *httptest.Server {
+func newServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewTLSServer(mux)
+	srv := httptest.NewTLSServer(h)
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-// ---------------------------------------------------------------------------
-// AppRole
-// ---------------------------------------------------------------------------
-
-func TestNew_AppRole(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/auth/approle/login", tokenHandler("tok-approle"))
-	srv := newTLSServer(t, mux)
-
-	_, err := vault.New(config.VaultConfig{
-		Addr:        srv.URL,
+func baseConfig(addr string) config.VaultConfig {
+	return config.VaultConfig{
+		Addr:        addr,
 		AuthMethod:  config.AuthMethodAppRole,
 		ApprolePath: "approle",
 		RoleID:      "role-id",
-	})
-	if err != nil {
-		t.Fatalf("AppRole auth failed: %v", err)
+		MountPoint:  "pki_int",
+		RoleName:    "my-role",
 	}
 }
 
-func TestNew_AppRole_WithSecretID(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/auth/approle/login", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		json.NewDecoder(r.Body).Decode(&body)
-		if body["secret_id"] != "my-secret" {
-			http.Error(w, "missing secret_id", http.StatusBadRequest)
-			return
-		}
-		tokenHandler("tok-approle-secret")(w, r)
+func TestNewAppRoleSendsRoleIDOnly(t *testing.T) {
+	var body map[string]any
+	var path string
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = fmt.Fprint(w, `{"auth":{"client_token":"s.token"}}`)
 	})
-	srv := newTLSServer(t, mux)
 
-	_, err := vault.New(config.VaultConfig{
-		Addr:        srv.URL,
-		AuthMethod:  config.AuthMethodAppRole,
-		ApprolePath: "approle",
-		RoleID:      "role-id",
-		SecretID:    "my-secret",
-	})
-	if err != nil {
-		t.Fatalf("AppRole+SecretID auth failed: %v", err)
+	if _, err := vault.New(baseConfig(srv.URL)); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if path != "/v1/auth/approle/login" {
+		t.Errorf("login path = %q", path)
+	}
+	if len(body) != 1 || body["role_id"] != "role-id" {
+		t.Errorf("login body = %v, want only role_id", body)
 	}
 }
 
-func TestNew_AppRole_DefaultPath(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/auth/approle/login", tokenHandler("tok"))
-	srv := newTLSServer(t, mux)
+func TestNewKubernetesSendsRoleAndJWT(t *testing.T) {
+	jwt := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(jwt, []byte("the-jwt\n"), 0o600); err != nil {
+		t.Fatalf("write jwt: %v", err)
+	}
 
-	_, err := vault.New(config.VaultConfig{
-		Addr:       srv.URL,
-		AuthMethod: config.AuthMethodAppRole,
-		RoleID:     "role-id",
-		// ApprolePath intentionally omitted — should default to "approle"
+	var body map[string]any
+	var path string
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = fmt.Fprint(w, `{"auth":{"client_token":"s.token"}}`)
 	})
-	if err != nil {
-		t.Fatalf("AppRole default path failed: %v", err)
+
+	cfg := baseConfig(srv.URL)
+	cfg.AuthMethod = config.AuthMethodKubernetes
+	cfg.K8sMount = "kubernetes"
+	cfg.K8sRole = "my-certmanager-role"
+	cfg.JWTPath = jwt
+
+	if _, err := vault.New(cfg); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if path != "/v1/auth/kubernetes/login" {
+		t.Errorf("login path = %q", path)
+	}
+	if body["role"] != "my-certmanager-role" || body["jwt"] != "the-jwt" {
+		t.Errorf("login body = %v", body)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// LDAP
-// ---------------------------------------------------------------------------
-
-func TestNew_LDAP(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/auth/ldap/login/testuser", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		json.NewDecoder(r.Body).Decode(&body)
-		if body["password"] != "secret" {
-			http.Error(w, "bad password", http.StatusForbidden)
-			return
-		}
-		tokenHandler("tok-ldap")(w, r)
-	})
-	srv := newTLSServer(t, mux)
-
-	_, err := vault.New(config.VaultConfig{
-		Addr:         srv.URL,
-		AuthMethod:   config.AuthMethodLDAP,
-		LDAPPath:     "ldap",
-		LDAPUsername: "testuser",
-		LDAPPassword: "secret",
-	})
-	if err != nil {
-		t.Fatalf("LDAP auth failed: %v", err)
+func TestNewAuthErrors(t *testing.T) {
+	deny := func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprint(w, `{"errors":["permission denied"]}`)
 	}
-}
-
-func TestNew_LDAP_DefaultPath(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/auth/ldap/login/u", tokenHandler("tok"))
-	srv := newTLSServer(t, mux)
-
-	_, err := vault.New(config.VaultConfig{
-		Addr:         srv.URL,
-		AuthMethod:   config.AuthMethodLDAP,
-		LDAPUsername: "u",
-		LDAPPassword: "p",
-	})
-	if err != nil {
-		t.Fatalf("LDAP default path failed: %v", err)
+	noToken := func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"auth":{}}`)
 	}
-}
 
-// ---------------------------------------------------------------------------
-// Kubernetes
-// ---------------------------------------------------------------------------
-
-func TestNew_Kubernetes(t *testing.T) {
-	tmp := t.TempDir()
-	tokenFile := filepath.Join(tmp, "token")
-	os.WriteFile(tokenFile, []byte("k8s-jwt"), 0o600)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/auth/kubernetes/login", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		json.NewDecoder(r.Body).Decode(&body)
-		if body["jwt"] != "k8s-jwt" || body["role"] != "puppet" {
-			http.Error(w, "bad jwt/role", http.StatusForbidden)
-			return
-		}
-		tokenHandler("tok-k8s")(w, r)
-	})
-	srv := newTLSServer(t, mux)
-
-	_, err := vault.New(config.VaultConfig{
-		Addr:                srv.URL,
-		AuthMethod:          config.AuthMethodKubernetes,
-		KubernetesPath:      "kubernetes",
-		KubernetesRole:      "puppet",
-		KubernetesTokenFile: tokenFile,
-	})
-	if err != nil {
-		t.Fatalf("Kubernetes auth failed: %v", err)
-	}
-}
-
-func TestNew_Kubernetes_MissingTokenFile(t *testing.T) {
-	_, err := vault.New(config.VaultConfig{
-		Addr:                "https://vault.example.com",
-		AuthMethod:          config.AuthMethodKubernetes,
-		KubernetesRole:      "puppet",
-		KubernetesTokenFile: "/nonexistent/token",
-	})
-	if err == nil || !strings.Contains(err.Error(), "read service account token") {
-		t.Errorf("expected token file error, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Token
-// ---------------------------------------------------------------------------
-
-func TestNew_Token(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/pki_int/issue/role", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Vault-Token") != "static-token" {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{
-				"certificate": "C", "private_key": "K", "issuing_ca": "CA",
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		mutate  func(*testing.T, *config.VaultConfig)
+		wantErr string
+	}{
+		{
+			name:    "approle rejected",
+			handler: deny,
+			wantErr: "approle login: POST auth/approle/login: vault returned 403",
+		},
+		{
+			name:    "approle returns no token",
+			handler: noToken,
+			wantErr: "no auth.client_token",
+		},
+		{
+			name:    "kubernetes rejected",
+			handler: deny,
+			mutate: func(t *testing.T, c *config.VaultConfig) {
+				jwt := filepath.Join(t.TempDir(), "token")
+				if err := os.WriteFile(jwt, []byte("jwt"), 0o600); err != nil {
+					t.Fatalf("write jwt: %v", err)
+				}
+				c.AuthMethod = config.AuthMethodKubernetes
+				c.K8sMount = "kubernetes"
+				c.K8sRole = "role"
+				c.JWTPath = jwt
 			},
-		})
-	})
-	srv := newTLSServer(t, mux)
+			wantErr: "kubernetes login: POST auth/kubernetes/login: vault returned 403",
+		},
+		{
+			name:    "kubernetes jwt missing",
+			handler: noToken,
+			mutate: func(t *testing.T, c *config.VaultConfig) {
+				c.AuthMethod = config.AuthMethodKubernetes
+				c.K8sMount = "kubernetes"
+				c.K8sRole = "role"
+				c.JWTPath = filepath.Join(t.TempDir(), "absent")
+			},
+			wantErr: "read service account token",
+		},
+		{
+			name:    "unknown auth method",
+			handler: noToken,
+			mutate:  func(t *testing.T, c *config.VaultConfig) { c.AuthMethod = "ldap" },
+			wantErr: `unknown vault.auth_method "ldap"`,
+		},
+		{
+			name:    "bad timeout",
+			handler: noToken,
+			mutate:  func(t *testing.T, c *config.VaultConfig) { c.Timeout = "eventually" },
+			wantErr: "not a valid duration",
+		},
+	}
 
-	client, err := vault.New(config.VaultConfig{
-		Addr:       srv.URL,
-		AuthMethod: config.AuthMethodToken,
-		Token:      "static-token",
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newServer(t, tc.handler)
+			cfg := baseConfig(srv.URL)
+			if tc.mutate != nil {
+				tc.mutate(t, &cfg)
+			}
+			_, err := vault.New(cfg)
+			if err == nil {
+				t.Fatal("New succeeded, want error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewKubernetesEmptyJWT(t *testing.T) {
+	jwt := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(jwt, []byte("\n\t "), 0o600); err != nil {
+		t.Fatalf("write jwt: %v", err)
+	}
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("vault must not be contacted when the JWT is empty")
+		_, _ = fmt.Fprint(w, `{"auth":{"client_token":"s.token"}}`)
 	})
+
+	cfg := baseConfig(srv.URL)
+	cfg.AuthMethod = config.AuthMethodKubernetes
+	cfg.K8sMount = "kubernetes"
+	cfg.K8sRole = "role"
+	cfg.JWTPath = jwt
+
+	_, err := vault.New(cfg)
+	if err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("error = %v, want an empty-JWT failure", err)
+	}
+}
+
+func TestPostSendsToken(t *testing.T) {
+	var token string
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/login") {
+			_, _ = fmt.Fprint(w, `{"auth":{"client_token":"s.token"}}`)
+			return
+		}
+		token = r.Header.Get("X-Vault-Token")
+		_, _ = fmt.Fprint(w, `{"data":{"ok":true}}`)
+	})
+
+	c, err := vault.New(baseConfig(srv.URL))
 	if err != nil {
-		t.Fatalf("Token auth failed: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-
-	var out map[string]any
-	if err := client.Post("pki_int/issue/role", map[string]string{"common_name": "x"}, &out); err != nil {
-		t.Fatalf("Post with token auth failed: %v", err)
+	var out struct {
+		Data struct {
+			OK bool `json:"ok"`
+		} `json:"data"`
+	}
+	if err := c.Post("pki_int/issue/my-role", map[string]string{}, &out); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	if token != "s.token" {
+		t.Errorf("X-Vault-Token = %q", token)
+	}
+	if !out.Data.OK {
+		t.Error("response not decoded")
 	}
 }
 
-func TestNew_Token_Empty(t *testing.T) {
-	_, err := vault.New(config.VaultConfig{
-		Addr:       "https://vault.example.com",
-		AuthMethod: config.AuthMethodToken,
-		Token:      "",
+func TestPostTimesOut(t *testing.T) {
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/login") {
+			_, _ = fmt.Fprint(w, `{"auth":{"client_token":"s.token"}}`)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+		_, _ = fmt.Fprint(w, `{"data":{}}`)
 	})
+
+	cfg := baseConfig(srv.URL)
+	cfg.Timeout = "50ms"
+	c, err := vault.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	start := time.Now()
+	err = c.Post("pki_int/issue/my-role", map[string]string{}, &struct{}{})
 	if err == nil {
-		t.Error("expected error for empty token")
+		t.Fatal("Post succeeded, want a timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 400*time.Millisecond {
+		t.Errorf("Post took %v, the timeout did not apply", elapsed)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Unknown auth method
-// ---------------------------------------------------------------------------
-
-func TestNew_UnknownMethod(t *testing.T) {
-	_, err := vault.New(config.VaultConfig{
-		Addr:       "https://vault.example.com",
-		AuthMethod: "magic",
+func TestTLSVerificationCanBeEnabled(t *testing.T) {
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"auth":{"client_token":"s.token"}}`)
 	})
-	if err == nil || !strings.Contains(err.Error(), "unknown auth_method") {
-		t.Errorf("expected unknown method error, got %v", err)
-	}
-}
 
-// ---------------------------------------------------------------------------
-// Auth failure
-// ---------------------------------------------------------------------------
-
-func TestNew_AuthFailure(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "permission denied", http.StatusForbidden)
-	}))
-	t.Cleanup(srv.Close)
-
-	_, err := vault.New(config.VaultConfig{
-		Addr:        srv.URL,
-		AuthMethod:  config.AuthMethodAppRole,
-		ApprolePath: "approle",
-		RoleID:      "role-id",
-	})
-	if err == nil {
-		t.Error("expected auth error, got nil")
-	}
-}
-
-func TestNew_EmptyToken(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"auth": map[string]any{"client_token": ""},
-		})
-	}))
-	t.Cleanup(srv.Close)
-
-	_, err := vault.New(config.VaultConfig{
-		Addr:        srv.URL,
-		AuthMethod:  config.AuthMethodAppRole,
-		ApprolePath: "approle",
-		RoleID:      "role-id",
-	})
-	if err == nil || !strings.Contains(err.Error(), "empty client token") {
-		t.Errorf("expected empty token error, got %v", err)
+	cfg := baseConfig(srv.URL)
+	skip := false
+	cfg.TLSSkipVerify = &skip
+	if _, err := vault.New(cfg); err == nil {
+		t.Fatal("New succeeded against a self-signed server with verification enabled")
 	}
 }

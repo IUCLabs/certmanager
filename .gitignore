@@ -1,0 +1,5 @@
+# built binary (repo root only — not the cmd/ source dir)
+/certmanager
+# cross-compiled release artifacts (e.g. certmanager-linux-amd64)
+/certmanager-*
+dist/

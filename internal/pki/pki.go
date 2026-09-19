@@ -7,18 +7,19 @@ import (
 	"github.com/IUCLabs/certmanager/internal/vault"
 )
 
-// CertificateResponse is the JSON-serialisable output returned to callers.
+// CertificateResponse is the JSON document printed with --json and consumed by
+// parsejson() in profiles::pki::vault. Field order fixes the key order.
 type CertificateResponse struct {
-	Certificate    string `json:"certificate"`
-	PrivateKey     string `json:"private_key"`
-	FullChain      string `json:"full_chain"`
-	CACertificate  string `json:"ca_certificate"`
+	Certificate   string `json:"certificate"`
+	PrivateKey    string `json:"private_key"`
+	FullChain     string `json:"full_chain"`
+	CACertificate string `json:"ca_certificate"`
 }
 
 type issueRequest struct {
 	CommonName string `json:"common_name"`
-	AltNames   string `json:"alt_names,omitempty"`
-	IPSans     string `json:"ip_sans,omitempty"`
+	AltNames   string `json:"alt_names"`
+	IPSans     string `json:"ip_sans"`
 	TTL        string `json:"ttl"`
 }
 
@@ -30,31 +31,27 @@ type issueResponse struct {
 	} `json:"data"`
 }
 
-// IssueCert requests a PKI certificate from Vault.
+// IssueCert requests a certificate from the Vault PKI role.
 func IssueCert(client *vault.Client, mountPoint, roleName, commonName string, altNames, ipSans []string, expiryDays int) (*CertificateResponse, error) {
 	req := issueRequest{
 		CommonName: commonName,
+		AltNames:   strings.Join(altNames, ","),
+		IPSans:     strings.Join(ipSans, ","),
 		TTL:        fmt.Sprintf("%dd", expiryDays),
-	}
-	if len(altNames) > 0 {
-		req.AltNames = strings.Join(altNames, ",")
-	}
-	if len(ipSans) > 0 {
-		req.IPSans = strings.Join(ipSans, ",")
 	}
 
 	var resp issueResponse
-	path := fmt.Sprintf("%s/issue/%s", mountPoint, roleName)
-	if err := client.Post(path, req, &resp); err != nil {
+	if err := client.Post(fmt.Sprintf("%s/issue/%s", mountPoint, roleName), req, &resp); err != nil {
 		return nil, err
 	}
-
-	fullChain := resp.Data.IssuingCA + "\n" + resp.Data.Certificate
+	if resp.Data.Certificate == "" || resp.Data.PrivateKey == "" {
+		return nil, fmt.Errorf("vault returned no certificate data for %q", commonName)
+	}
 
 	return &CertificateResponse{
 		Certificate:   resp.Data.Certificate,
 		PrivateKey:    resp.Data.PrivateKey,
-		FullChain:     fullChain,
+		FullChain:     resp.Data.IssuingCA + "\n" + resp.Data.Certificate,
 		CACertificate: resp.Data.IssuingCA,
 	}, nil
 }

@@ -3,160 +3,125 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
-func TestDefaultPath_XDGSet(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", "/tmp/xdg")
-	got := DefaultPath()
-	want := "/tmp/xdg/certmanager/config.yaml"
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
 	}
+	return path
 }
 
-func TestDefaultPath_XDGUnset(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", "")
-	home, _ := os.UserHomeDir()
-	got := DefaultPath()
-	want := filepath.Join(home, ".config", "certmanager", "config.yaml")
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
-	}
-}
-
-func TestLoad_AppRole(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "config.yaml")
-	content := `
-vault:
+const approleBody = `vault:
   addr: https://vault.example.com:8200
-  auth_method: approle
   approle_path: approle
-  role_id: my-role-id
+  role_id: abc-123
   mount_point: pki_int
   role_name: my-role
-  output_path: /tmp/certs
+  output_path: /tmp/certmanager
 `
-	os.WriteFile(path, []byte(content), 0o644)
 
-	cfg, err := Load(path)
+func TestLoadAppRoleDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, approleBody))
 	if err != nil {
-		t.Fatalf("Load() error: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
+
 	if cfg.Vault.AuthMethod != AuthMethodAppRole {
-		t.Errorf("auth_method = %q", cfg.Vault.AuthMethod)
+		t.Errorf("auth_method = %q, want %q (default)", cfg.Vault.AuthMethod, AuthMethodAppRole)
 	}
-	if cfg.Vault.RoleID != "my-role-id" {
-		t.Errorf("role_id = %q", cfg.Vault.RoleID)
+	if cfg.Vault.JWTPath != DefaultJWTPath {
+		t.Errorf("jwt_path = %q, want %q", cfg.Vault.JWTPath, DefaultJWTPath)
+	}
+	if cfg.Vault.OutputPath != "/tmp/certmanager" {
+		t.Errorf("output_path = %q, want it read from under vault:", cfg.Vault.OutputPath)
+	}
+	if !cfg.Vault.SkipTLSVerify() {
+		t.Error("tls_skip_verify must default to true")
+	}
+	d, err := cfg.Vault.RequestTimeout()
+	if err != nil || d != DefaultTimeout {
+		t.Errorf("RequestTimeout() = %v, %v, want %v", d, err, DefaultTimeout)
 	}
 }
 
-func TestLoad_DefaultAuthMethod(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "config.yaml")
-	// Omit auth_method — should default to approle for backwards compat.
-	content := `
-vault:
-  addr: https://vault.example.com:8200
-  role_id: my-role-id
-  approle_path: approle
-  mount_point: pki_int
-  role_name: my-role
-`
-	os.WriteFile(path, []byte(content), 0o644)
-
-	cfg, err := Load(path)
+func TestLoadOverrides(t *testing.T) {
+	cfg, err := Load(writeConfig(t, approleBody+"  tls_skip_verify: false\n  timeout: 5s\n"))
 	if err != nil {
-		t.Fatalf("Load() error: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Vault.AuthMethod != AuthMethodAppRole {
-		t.Errorf("expected default approle, got %q", cfg.Vault.AuthMethod)
+	if cfg.Vault.SkipTLSVerify() {
+		t.Error("tls_skip_verify: false must disable skipping")
 	}
-}
-
-func TestLoad_LDAP(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "config.yaml")
-	content := `
-vault:
-  addr: https://vault.example.com:8200
-  auth_method: ldap
-  ldap_path: ldap
-  ldap_username: alice
-  ldap_password: secret
-  mount_point: pki_int
-  role_name: my-role
-`
-	os.WriteFile(path, []byte(content), 0o644)
-
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.Vault.AuthMethod != AuthMethodLDAP {
-		t.Errorf("auth_method = %q", cfg.Vault.AuthMethod)
-	}
-	if cfg.Vault.LDAPUsername != "alice" {
-		t.Errorf("ldap_username = %q", cfg.Vault.LDAPUsername)
+	d, err := cfg.Vault.RequestTimeout()
+	if err != nil || d != 5*time.Second {
+		t.Errorf("RequestTimeout() = %v, %v, want 5s", d, err)
 	}
 }
 
-func TestLoad_Kubernetes(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "config.yaml")
-	content := `
-vault:
+func TestLoadKubernetes(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `vault:
   addr: https://vault.example.com:8200
   auth_method: kubernetes
-  kubernetes_path: kubernetes
-  kubernetes_role: puppet
-  kubernetes_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+  k8s_mount: kubernetes
+  k8s_role: my-certmanager-role
   mount_point: pki_int
   role_name: my-role
-`
-	os.WriteFile(path, []byte(content), 0o644)
-
-	cfg, err := Load(path)
+`))
 	if err != nil {
-		t.Fatalf("Load() error: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Vault.AuthMethod != AuthMethodKubernetes {
-		t.Errorf("auth_method = %q", cfg.Vault.AuthMethod)
-	}
-	if cfg.Vault.KubernetesRole != "puppet" {
-		t.Errorf("kubernetes_role = %q", cfg.Vault.KubernetesRole)
+	if cfg.Vault.K8sMount != "kubernetes" || cfg.Vault.K8sRole != "my-certmanager-role" {
+		t.Errorf("kubernetes keys not parsed: %+v", cfg.Vault)
 	}
 }
 
-func TestLoad_Token(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "config.yaml")
-	content := `
-vault:
-  addr: https://vault.example.com:8200
-  auth_method: token
-  token: hvs.statictoken
-  mount_point: pki_int
-  role_name: my-role
-`
-	os.WriteFile(path, []byte(content), 0o644)
+func TestLoadErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{"missing addr", "vault:\n  mount_point: pki_int\n  role_name: r\n  role_id: x\n  approle_path: approle\n", "vault.addr"},
+		{"missing mount_point", "vault:\n  addr: https://v:8200\n  role_name: r\n  role_id: x\n  approle_path: approle\n", "vault.mount_point"},
+		{"missing role_name", "vault:\n  addr: https://v:8200\n  mount_point: pki_int\n  role_id: x\n  approle_path: approle\n", "vault.role_name"},
+		{"missing role_id", "vault:\n  addr: https://v:8200\n  mount_point: pki_int\n  role_name: r\n  approle_path: approle\n", "vault.role_id"},
+		{"missing approle_path", "vault:\n  addr: https://v:8200\n  mount_point: pki_int\n  role_name: r\n  role_id: x\n", "vault.approle_path"},
+		{"missing k8s_mount", "vault:\n  addr: https://v:8200\n  auth_method: kubernetes\n  k8s_role: r\n  mount_point: pki_int\n  role_name: r\n", "vault.k8s_mount"},
+		{"missing k8s_role", "vault:\n  addr: https://v:8200\n  auth_method: kubernetes\n  k8s_mount: m\n  mount_point: pki_int\n  role_name: r\n", "vault.k8s_role"},
+		{"unknown auth method", "vault:\n  addr: https://v:8200\n  auth_method: token\n  mount_point: pki_int\n  role_name: r\n", `unknown vault.auth_method "token"`},
+		{"bad timeout", approleBody + "  timeout: soon\n", "not a valid duration"},
+		{"zero timeout", approleBody + "  timeout: 0s\n", "must be positive"},
+		{"malformed yaml", "vault: [\n", "parse config"},
+	}
 
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error: %v", err)
-	}
-	if cfg.Vault.AuthMethod != AuthMethodToken {
-		t.Errorf("auth_method = %q", cfg.Vault.AuthMethod)
-	}
-	if cfg.Vault.Token != "hvs.statictoken" {
-		t.Errorf("token = %q", cfg.Vault.Token)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.body))
+			if err == nil {
+				t.Fatal("Load succeeded, want error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to mention %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 
-func TestLoad_MissingFile(t *testing.T) {
-	_, err := Load("/nonexistent/config.yaml")
-	if err == nil {
-		t.Error("expected error for missing file, got nil")
+func TestLoadMissingFile(t *testing.T) {
+	_, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err == nil || !strings.Contains(err.Error(), "open config") {
+		t.Fatalf("error = %v, want an open config failure", err)
+	}
+}
+
+func TestDefaultPath(t *testing.T) {
+	if got := DefaultPath(); got != "/opt/certmanager/config.yaml" {
+		t.Errorf("DefaultPath() = %q, want the Puppet-managed path", got)
 	}
 }
