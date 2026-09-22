@@ -1,5 +1,5 @@
 // Package integration holds the end-to-end tests that run against a real Vault
-// dev server. The tests are behind the `integration` build tag; this file
-// keeps the package buildable for a plain `go test ./...`, which otherwise
-// fails on a package whose files are all excluded by build constraints.
+// dev server. Those tests are behind the `integration` build tag; the
+// subprocess environment they share, and its own test, are not, so a plain
+// `go test ./...` still guards the helper the tagged tests depend on.
 package integration
