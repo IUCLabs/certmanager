@@ -869,9 +869,17 @@ func TestIsTerminalRejectsNonTerminals(t *testing.T) {
 		if isTerminal(f) {
 			t.Errorf("%s is not a terminal", name)
 		}
+		// An explicit empty argv, never nil: cobra falls back to os.Args[1:]
+		// for a nil one, which under `go test -args foo` would turn this into
+		// `certmanager foo` and issue against whatever Vault the host's
+		// config resolves to. The stderr assertion is what catches that.
 		var stderr bytes.Buffer
-		if code := run(nil, f, &stderr); code == 0 {
+		code := run([]string{}, f, &stderr)
+		if code == 0 {
 			t.Errorf("%s: bare invocation exit code = 0, want non-zero", name)
+		}
+		if want := "a common name is required"; !strings.Contains(stderr.String(), want) {
+			t.Errorf("%s: stderr = %q, want it to contain %q", name, stderr.String(), want)
 		}
 	}
 }
