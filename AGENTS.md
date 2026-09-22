@@ -44,7 +44,9 @@ dist/                         # build output: binaries, RPM, checksums (not comm
 
 - **`run(args, stdout, stderr) int`** is the testable entry point; `main()` only
   wires it to the real streams and `os.Exit`. Cobra runs with `SilenceUsage` and
-  `SilenceErrors` so nothing reaches stderr unless the run failed.
+  `SilenceErrors` so nothing reaches stderr unless the run failed. `run` derives
+  interactivity from `isTerminal(stdout)` and hands it to `runWith`, which tests
+  call directly to pin either side.
 - **Flat CLI**: the root command takes `common_name` positionally
   (`cobra.MaximumNArgs(1)`); no args prints help only when stdout is a terminal
   and otherwise fails, args-less flags fail. `ca`, `completion` and `help` are
