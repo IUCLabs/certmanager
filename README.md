@@ -21,7 +21,12 @@ failure path exits non-zero.
 ```
 certmanager <common_name> [flags]   # issue a certificate
 certmanager ca [flags]              # print the CA chain
+certmanager                         # print help
 ```
+
+The common name is positional, with no `pki` subcommand in front of it — that
+is the form Puppet calls, and it is the only issuing form. `ca`, `completion`
+and `help` are the subcommands; every other first argument is a common name.
 
 | Flag | Short | Type | Default | Description |
 |---|---|---|---|---|
@@ -30,7 +35,7 @@ certmanager ca [flags]              # print the CA chain
 | `--expiry-days` | `-e` | int | `365` | Certificate validity in days (`ttl: <n>d`) |
 | `--compress` | `-c` | bool | `false` | Write a zip instead of a directory |
 | `--json` | | bool | `false` | Print the certificate data as JSON |
-| `--config` | | path | `/opt/certmanager/config.yaml` | Config file location |
+| `--config` | | path | resolved (see below) | Config file location |
 
 `ca` takes `--config` plus:
 
@@ -101,8 +106,21 @@ stdout.
 
 ## Configuration
 
-YAML, everything nested under `vault:`. The path is baked in at build time
-(`make build CONFIG_PATH=...`) and overridable per-invocation with `--config`.
+YAML, everything nested under `vault:`.
+
+### Config resolution order
+
+1. `--config <path>`, which always wins;
+2. `$XDG_CONFIG_HOME/certmanager/config.yaml`, if the file exists;
+3. `$HOME/.config/certmanager/config.yaml`, if the file exists;
+4. `/opt/certmanager/config.yaml`, the path baked in at build time
+   (`make build CONFIG_PATH=...`).
+
+Steps 2 and 3 are skipped unless the file is really there, so the last step is
+what Puppet gets: `generate()` runs the binary as the `puppet` user with no
+usable home directory, and `profiles::helpers::certmanager` writes the config
+to `/opt/certmanager/config.yaml` on managed nodes. The k8s puppetserver
+compilers mount it at the same path.
 
 | Key | Required | Default | Notes |
 |---|---|---|---|

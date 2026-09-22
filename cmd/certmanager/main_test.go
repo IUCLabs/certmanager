@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/IUCLabs/certmanager/internal/config"
 )
 
 const (
@@ -767,5 +769,91 @@ func TestRunCAFailures(t *testing.T) {
 				t.Errorf("stderr = %q, want it to mention %q", stderr.String(), tc.wantErr)
 			}
 		})
+	}
+}
+
+// A bare invocation is a human at a terminal, not Puppet: print help and exit
+// zero rather than failing on the missing positional.
+func TestRunNoArgsPrintsHelp(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run(nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Usage:") {
+		t.Errorf("stdout = %q, want the help text", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "certmanager <common_name>") {
+		t.Errorf("help does not document the positional form: %q", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// seedXDGConfig writes a config where DefaultPath() looks first.
+func seedXDGConfig(t *testing.T, addr string) {
+	t.Helper()
+	xdg := t.TempDir()
+	dir := filepath.Join(xdg, "certmanager")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := "vault:\n  addr: " + addr + "\n  auth_method: approle\n" +
+		"  approle_path: approle\n  role_id: test-role-id\n" +
+		"  mount_point: pki_int\n  role_name: my-role\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("HOME", t.TempDir())
+}
+
+// Puppet passes no --config, so the resolved path has to be used.
+func TestRunResolvesConfigWithoutFlag(t *testing.T) {
+	srv, got := newVaultStub(t, stubOptions{})
+	seedXDGConfig(t, srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"host.example.com", "--alt-names", "host", "--expiry-days", "90", "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if got.issueBody["common_name"] != "host.example.com" {
+		t.Errorf("common_name = %v", got.issueBody["common_name"])
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// The ca subcommand shares the same resolution.
+func TestRunCAResolvesConfigWithoutFlag(t *testing.T) {
+	srv, got := newVaultStub(t, stubOptions{})
+	seedXDGConfig(t, srv.URL)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"ca"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	if !got.caRequested {
+		t.Error("the CA chain endpoint was never called")
+	}
+}
+
+// With no config anywhere the run fails naming the baked-in path, not a
+// home-relative one that could never exist under generate().
+func TestRunWithoutAnyConfigNamesTheBakedPath(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"host.example.com", "--json"}, &stdout, &stderr); code == 0 {
+		t.Fatal("exit code = 0, want non-zero")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), config.FallbackPath()) {
+		t.Errorf("stderr = %q, want it to name %q", stderr.String(), config.FallbackPath())
 	}
 }

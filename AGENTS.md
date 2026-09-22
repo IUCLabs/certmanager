@@ -46,8 +46,9 @@ dist/                         # build output: binaries, RPM, checksums (not comm
   wires it to the real streams and `os.Exit`. Cobra runs with `SilenceUsage` and
   `SilenceErrors` so nothing reaches stderr unless the run failed.
 - **Flat CLI**: the root command takes `common_name` positionally
-  (`cobra.ExactArgs(1)`). `ca`, `completion` and `help` are the only
-  subcommands; `--config` is persistent so `ca` shares it.
+  (`cobra.MaximumNArgs(1)`); no args prints help, args-less flags fail. `ca`,
+  `completion` and `help` are the only subcommands; `--config` is persistent so
+  `ca` shares it.
 - **`ca` is unauthenticated**: `GET {addr}/v1/{mount}/ca_chain` sends no
   `X-Vault-Token` and loads the config through `config.LoadCA`, which requires
   only `vault.addr`. The body is parsed as PEM, never sniffed — Vault labels it
@@ -59,8 +60,13 @@ dist/                         # build output: binaries, RPM, checksums (not comm
 - **`vault.New`** authenticates once and never falls back between auth methods.
   Every request is bounded by `vault.timeout` (default 30s) — the Python set no
   timeout, so a black-holed Vault hung the whole catalog compile.
-- **`config.defaultPath`** is baked in at build time via
-  `-X ...internal/config.defaultPath=` (`make build CONFIG_PATH=...`).
+- **`config.Resolve`** picks the config: `--config`, then
+  `$XDG_CONFIG_HOME/certmanager/config.yaml`, then
+  `$HOME/.config/certmanager/config.yaml` (both only if the file exists), then
+  `config.FallbackPath()` — baked in at build time via
+  `-X ...internal/config.defaultPath=` (`make build CONFIG_PATH=...`). Under
+  `generate()` the puppet user has no usable home, so the baked path is what
+  resolves.
 
 ## Deliberate deviations from the Python script
 
