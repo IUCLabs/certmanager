@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -28,8 +29,42 @@ const DefaultTimeout = 30 * time.Second
 // -X github.com/IUCLabs/certmanager/internal/config.defaultPath=/some/path
 var defaultPath = "/opt/certmanager/config.yaml"
 
-// DefaultPath returns the config path baked in at build time.
-func DefaultPath() string { return defaultPath }
+// FallbackPath returns the config path baked in at build time. Puppet writes
+// the config there, and it is the only path that resolves under generate(),
+// which runs as the puppet user with no usable home directory.
+func FallbackPath() string { return defaultPath }
+
+// DefaultPath resolves the config to use when --config was not given:
+// $XDG_CONFIG_HOME/certmanager/config.yaml, then
+// $HOME/.config/certmanager/config.yaml, then FallbackPath(). The first two
+// are only taken when the file is actually there, so an unset or unusable
+// HOME lands on the Puppet-managed path instead of a path that cannot exist.
+func DefaultPath() string {
+	if base := os.Getenv("XDG_CONFIG_HOME"); base != "" {
+		if p := filepath.Join(base, "certmanager", "config.yaml"); isFile(p) {
+			return p
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if p := filepath.Join(home, ".config", "certmanager", "config.yaml"); isFile(p) {
+			return p
+		}
+	}
+	return defaultPath
+}
+
+// Resolve picks the config path for a run: an explicit --config always wins.
+func Resolve(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return DefaultPath()
+}
+
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
 
 // Config is the top-level configuration structure.
 type Config struct {

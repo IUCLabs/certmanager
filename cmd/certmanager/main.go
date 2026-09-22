@@ -52,11 +52,20 @@ func rootCmd() *cobra.Command {
 		Use:           "certmanager <common_name>",
 		Short:         "Issue a PKI certificate from HashiCorp Vault",
 		Version:       version,
-		Args:          cobra.ExactArgs(1),
+		Args:          cobra.MaximumNArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(cfgFile)
+			if len(args) == 0 {
+				// A bare invocation is someone asking what this is; flags
+				// without a common name is a malformed call and must fail.
+				if cmd.Flags().NFlag() == 0 {
+					return cmd.Help()
+				}
+				return fmt.Errorf("a common name is required")
+			}
+
+			cfg, err := config.Load(config.Resolve(cfgFile))
 			if err != nil {
 				return err
 			}
@@ -79,9 +88,10 @@ func rootCmd() *cobra.Command {
 		},
 	}
 
-	// Persistent so the ca subcommand shares it; the positional form keeps
-	// parsing --config exactly as before.
-	cmd.PersistentFlags().StringVar(&cfgFile, "config", config.DefaultPath(), "path to config.yaml")
+	// Persistent so the ca subcommand shares it; empty means "resolve", which
+	// keeps the resolution order out of the usage text and out of --help.
+	cmd.PersistentFlags().StringVar(&cfgFile, "config", "",
+		"path to config.yaml (default: $XDG_CONFIG_HOME or ~/.config, else "+config.FallbackPath()+")")
 	cmd.Flags().StringVarP(&altNames, "alt-names", "a", "", "comma-separated DNS subject alternative names")
 	cmd.Flags().StringVarP(&ipSans, "ip-sans", "i", "", "comma-separated IP subject alternative names")
 	cmd.Flags().IntVarP(&expiryDays, "expiry-days", "e", 365, "certificate validity in days")
@@ -106,7 +116,7 @@ func caCmd(cfgFile *string) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.LoadCA(*cfgFile)
+			cfg, err := config.LoadCA(config.Resolve(*cfgFile))
 			if err != nil {
 				return err
 			}

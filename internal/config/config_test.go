@@ -120,9 +120,100 @@ func TestLoadMissingFile(t *testing.T) {
 	}
 }
 
-func TestDefaultPath(t *testing.T) {
-	if got := DefaultPath(); got != "/opt/certmanager/config.yaml" {
-		t.Errorf("DefaultPath() = %q, want the Puppet-managed path", got)
+func TestFallbackPath(t *testing.T) {
+	if got := FallbackPath(); got != "/opt/certmanager/config.yaml" {
+		t.Errorf("FallbackPath() = %q, want the Puppet-managed path", got)
+	}
+}
+
+// seedConfig drops a config file at dir/certmanager/config.yaml and returns it.
+func seedConfig(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "certmanager", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(approleBody), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return path
+}
+
+func TestDefaultPathPrefersXDG(t *testing.T) {
+	xdg := t.TempDir()
+	home := t.TempDir()
+	want := seedConfig(t, xdg)
+	seedConfig(t, filepath.Join(home, ".config"))
+
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("HOME", home)
+
+	if got := DefaultPath(); got != want {
+		t.Errorf("DefaultPath() = %q, want the XDG config %q", got, want)
+	}
+}
+
+func TestDefaultPathFallsBackToHome(t *testing.T) {
+	home := t.TempDir()
+	want := seedConfig(t, filepath.Join(home, ".config"))
+
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", home)
+
+	if got := DefaultPath(); got != want {
+		t.Errorf("DefaultPath() = %q, want the home config %q", got, want)
+	}
+}
+
+// XDG pointing somewhere without a config must not shadow a usable home one.
+func TestDefaultPathSkipsXDGWithoutAConfig(t *testing.T) {
+	home := t.TempDir()
+	want := seedConfig(t, filepath.Join(home, ".config"))
+
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", home)
+
+	if got := DefaultPath(); got != want {
+		t.Errorf("DefaultPath() = %q, want the home config %q", got, want)
+	}
+}
+
+// What generate() sees: the puppet user has no usable home, so neither lookup
+// yields a file and the baked-in path has to win.
+func TestDefaultPathFallsBackToBakedPath(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	if got := DefaultPath(); got != FallbackPath() {
+		t.Errorf("DefaultPath() = %q, want %q", got, FallbackPath())
+	}
+}
+
+func TestDefaultPathIgnoresADirectory(t *testing.T) {
+	xdg := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(xdg, "certmanager", "config.yaml"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("HOME", t.TempDir())
+
+	if got := DefaultPath(); got != FallbackPath() {
+		t.Errorf("DefaultPath() = %q, want %q", got, FallbackPath())
+	}
+}
+
+func TestResolvePrefersExplicitPath(t *testing.T) {
+	xdg := t.TempDir()
+	seedConfig(t, xdg)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("HOME", t.TempDir())
+
+	explicit := writeConfig(t, approleBody)
+	if got := Resolve(explicit); got != explicit {
+		t.Errorf("Resolve(%q) = %q, want the explicit path", explicit, got)
+	}
+	if got := Resolve(""); got == explicit {
+		t.Error("Resolve(\"\") returned the explicit path")
 	}
 }
 
