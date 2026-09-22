@@ -286,6 +286,28 @@ func hermeticEnv(t *testing.T) []string {
 	}
 }
 
+// Neither leg of the resolution order announces itself when it is missing: an
+// unset HOME or XDG_CONFIG_HOME silently falls through to whatever the
+// developer has. Both must therefore be set to somewhere empty, not dropped.
+func TestHermeticEnvSetsBothConfigLegs(t *testing.T) {
+	env := hermeticEnv(t)
+	for _, key := range []string{"HOME=", "XDG_CONFIG_HOME="} {
+		idx := slices.IndexFunc(env, func(e string) bool { return strings.HasPrefix(e, key) })
+		if idx < 0 {
+			t.Fatalf("%s is unset in the subprocess env: %v", key, env)
+		}
+		dir := strings.TrimPrefix(env[idx], key)
+		if !filepath.IsAbs(dir) {
+			t.Errorf("%s%s is not an absolute path", key, dir)
+		}
+		for _, rel := range []string{"certmanager/config.yaml", ".config/certmanager/config.yaml"} {
+			if _, err := os.Stat(filepath.Join(dir, rel)); err == nil {
+				t.Errorf("%s%s already holds %s", key, dir, rel)
+			}
+		}
+	}
+}
+
 func runCertmanager(t *testing.T, bin string, args ...string) (int, string, string) {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
@@ -498,15 +520,21 @@ func TestIgnoresTheDevelopersConfig(t *testing.T) {
 	dir := t.TempDir()
 	bin := buildBinary(t, dir, writeConfig(t, dir, roleID))
 
+	// Both legs of the resolution order get a config, so either one leaking
+	// into the subprocess points it at an unreachable Vault and fails the run.
 	poisoned := t.TempDir()
-	cfgDir := filepath.Join(poisoned, "certmanager")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
 	body := "vault:\n  addr: http://127.0.0.1:1\n  mount_point: nope\n  role_name: nope\n" +
 		"  approle_path: approle\n  role_id: nope\n"
-	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(body), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
+	for _, cfgDir := range []string{
+		filepath.Join(poisoned, "certmanager"),
+		filepath.Join(poisoned, ".config", "certmanager"),
+	} {
+		if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(body), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
 	}
 	t.Setenv("XDG_CONFIG_HOME", poisoned)
 	t.Setenv("HOME", poisoned)
