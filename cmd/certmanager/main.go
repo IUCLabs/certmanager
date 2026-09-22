@@ -44,9 +44,10 @@ func runWith(args []string, stdout, stderr io.Writer, interactive bool) int {
 }
 
 // isTerminal reports whether w is a terminal. Puppet hands the child a temp
-// file as fd 1, never a terminal, so anything else is a machine caller. The check is a
-// terminal ioctl, not a character-device stat: /dev/null is a character device,
-// and so is the /dev/null the Go runtime reopens onto a closed fd 1 at startup.
+// file as fd 1, never a terminal, so anything else is a machine caller. The
+// check is a terminal ioctl, not a character-device stat: /dev/null is a
+// character device, and so is the /dev/null the Go runtime reopens onto a
+// closed fd 1 at startup.
 func isTerminal(w io.Writer) bool {
 	f, ok := w.(*os.File)
 	if !ok {
