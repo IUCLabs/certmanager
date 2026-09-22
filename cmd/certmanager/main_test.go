@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -832,7 +833,10 @@ func TestRunNoArgsPipedStdoutFails(t *testing.T) {
 	}
 }
 
-func TestIsTerminal(t *testing.T) {
+// Every stdout a machine caller can hand the binary must read as
+// not-a-terminal. /dev/null is the trap: it is a character device, so a stat of
+// the file mode calls it a terminal and lets help escape with exit zero.
+func TestIsTerminalRejectsNonTerminals(t *testing.T) {
 	var buf bytes.Buffer
 	if isTerminal(&buf) {
 		t.Error("a bytes.Buffer is not a terminal")
@@ -842,20 +846,65 @@ func TestIsTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	defer func() { _ = r.Close() }()
-	defer func() { _ = w.Close() }()
-	if isTerminal(w) {
-		t.Error("a pipe is not a terminal")
-	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
 
-	tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	regular, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
 	if err != nil {
-		t.Skipf("no controlling terminal: %v", err)
+		t.Fatalf("create: %v", err)
 	}
-	defer func() { _ = tty.Close() }()
-	if !isTerminal(tty) {
-		t.Error("/dev/tty is a terminal")
+	t.Cleanup(func() { _ = regular.Close() })
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
 	}
+	t.Cleanup(func() { _ = devNull.Close() })
+
+	for name, f := range map[string]*os.File{
+		"pipe":         w,
+		"regular file": regular,
+		os.DevNull:     devNull,
+		"unix socket":  unixSocket(t),
+	} {
+		if isTerminal(f) {
+			t.Errorf("%s is not a terminal", name)
+		}
+		var stderr bytes.Buffer
+		if code := run(nil, f, &stderr); code == 0 {
+			t.Errorf("%s: bare invocation exit code = 0, want non-zero", name)
+		}
+	}
+}
+
+// unixSocket returns a connected unix socket as an *os.File: the stdout a
+// caller gets when it wires the binary straight into a service.
+func unixSocket(t *testing.T) *os.File {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "s")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			_, _ = io.Copy(io.Discard, conn)
+			_ = conn.Close()
+		}
+	}()
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	f, err := conn.(*net.UnixConn).File()
+	if err != nil {
+		t.Fatalf("socket file: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
 }
 
 // --config with an empty value is a malformed call, not a request to resolve.

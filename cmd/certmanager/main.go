@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/IUCLabs/certmanager/internal/config"
 	"github.com/IUCLabs/certmanager/internal/pki"
@@ -43,14 +44,15 @@ func runWith(args []string, stdout, stderr io.Writer, interactive bool) int {
 }
 
 // isTerminal reports whether w is a terminal. Puppet's generate() captures
-// stdout through a pipe, so anything else is a machine caller.
+// stdout through a pipe, so anything else is a machine caller. The check is a
+// terminal ioctl, not a character-device stat: /dev/null is a character device,
+// and so is the /dev/null the Go runtime reopens onto a closed fd 1 at startup.
 func isTerminal(w io.Writer) bool {
 	f, ok := w.(*os.File)
 	if !ok {
 		return false
 	}
-	info, err := f.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(f.Fd()))
 }
 
 // resolveConfig turns the --config value into a path. An explicitly empty

@@ -46,7 +46,10 @@ dist/                         # build output: binaries, RPM, checksums (not comm
   wires it to the real streams and `os.Exit`. Cobra runs with `SilenceUsage` and
   `SilenceErrors` so nothing reaches stderr unless the run failed. `run` derives
   interactivity from `isTerminal(stdout)` and hands it to `runWith`, which tests
-  call directly to pin either side.
+  call directly to pin either side. `isTerminal` is a terminal ioctl
+  (`x/term.IsTerminal`), not a character-device stat: `/dev/null` and the
+  `/dev/null` the runtime reopens onto a closed fd 1 are character devices, and
+  a stat would hand both of them the help-and-exit-zero path.
 - **Flat CLI**: the root command takes `common_name` positionally
   (`cobra.MaximumNArgs(1)`); no args prints help only when stdout is a terminal
   and otherwise fails, args-less flags fail. `ca`, `completion` and `help` are
@@ -106,6 +109,12 @@ runs the binary with Puppet's argv and asserts exit code, empty stderr, the
 four JSON keys, the parsed X.509 CN/SANs/lifetime, and that a refused name
 exits non-zero with empty stdout. Dev mode is plain HTTP, so it does not
 exercise the TLS path.
+
+`TestBareInvocationHelpsOnlyATerminal` drives the built binary once per kind of
+fd 1 — pipe, regular file, unix socket, `/dev/null`, a closed fd 1 and a pty
+allocated from `/dev/ptmx` — and only the pty may exit zero with help on
+stdout. The pty is what pins the true branch: CI containers have no
+controlling terminal, so a test that reached for `/dev/tty` would skip.
 
 ## Gotchas
 

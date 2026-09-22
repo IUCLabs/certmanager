@@ -28,10 +28,11 @@ The common name is positional, with no `pki` subcommand in front of it — that
 is the form Puppet calls, and it is the only issuing form. `ca`, `completion`
 and `help` are the subcommands; every other first argument is a common name.
 
-A bare invocation prints help and exits zero only when stdout is a terminal.
-Puppet's `generate()` reads stdout through a pipe, so there a missing common
-name exits non-zero with nothing on stdout rather than feeding help text into
-the catalog.
+A bare invocation prints help and exits zero only when stdout is a terminal —
+a pipe, a file, a socket, `/dev/null` and a closed fd 1 all exit non-zero with
+nothing on stdout. Puppet's `generate()` reads stdout through a pipe, so there
+a missing common name fails the compile rather than feeding help text into the
+catalog.
 
 | Flag | Short | Type | Default | Description |
 |---|---|---|---|---|
