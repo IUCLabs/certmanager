@@ -110,6 +110,12 @@ four JSON keys, the parsed X.509 CN/SANs/lifetime, and that a refused name
 exits non-zero with empty stdout. Dev mode is plain HTTP, so it does not
 exercise the TLS path.
 
+`hermeticEnv`, the subprocess environment those tests share, sits outside the
+tag in `hermetic_env_test.go` so a plain `go test ./...` guards it. It replaces
+the ambient environment rather than extending it; its test asserts exactly
+that, because a helper that leaked `HOME` would point the binary at a real
+Vault and only the tagged tests would notice.
+
 `TestBareInvocationHelpsOnlyATerminal` drives the built binary once per kind of
 fd 1 — pipe, regular file, unix socket, `/dev/null`, a closed fd 1 and a pty
 allocated from `/dev/ptmx` — and only the pty may exit zero with help on
