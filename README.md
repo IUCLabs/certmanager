@@ -21,12 +21,17 @@ failure path exits non-zero.
 ```
 certmanager <common_name> [flags]   # issue a certificate
 certmanager ca [flags]              # print the CA chain
-certmanager                         # print help
+certmanager                         # print help (interactive terminals only)
 ```
 
 The common name is positional, with no `pki` subcommand in front of it — that
 is the form Puppet calls, and it is the only issuing form. `ca`, `completion`
 and `help` are the subcommands; every other first argument is a common name.
+
+A bare invocation prints help and exits zero only when stdout is a terminal.
+Puppet's `generate()` reads stdout through a pipe, so there a missing common
+name exits non-zero with nothing on stdout rather than feeding help text into
+the catalog.
 
 | Flag | Short | Type | Default | Description |
 |---|---|---|---|---|
@@ -110,8 +115,10 @@ YAML, everything nested under `vault:`.
 
 ### Config resolution order
 
-1. `--config <path>`, which always wins;
-2. `$XDG_CONFIG_HOME/certmanager/config.yaml`, if the file exists;
+1. `--config <path>`, which always wins; an empty `--config ''` is an error,
+   not a request to resolve;
+2. `$XDG_CONFIG_HOME/certmanager/config.yaml`, if `$XDG_CONFIG_HOME` is
+   absolute and the file exists;
 3. `$HOME/.config/certmanager/config.yaml`, if the file exists;
 4. `/opt/certmanager/config.yaml`, the path baked in at build time
    (`make build CONFIG_PATH=...`).

@@ -40,7 +40,8 @@ func FallbackPath() string { return defaultPath }
 // are only taken when the file is actually there, so an unset or unusable
 // HOME lands on the Puppet-managed path instead of a path that cannot exist.
 func DefaultPath() string {
-	if base := os.Getenv("XDG_CONFIG_HOME"); base != "" {
+	// The XDG spec requires a relative XDG_CONFIG_HOME to be ignored.
+	if base := os.Getenv("XDG_CONFIG_HOME"); filepath.IsAbs(base) {
 		if p := filepath.Join(base, "certmanager", "config.yaml"); isFile(p) {
 			return p
 		}
@@ -53,7 +54,8 @@ func DefaultPath() string {
 	return defaultPath
 }
 
-// Resolve picks the config path for a run: an explicit --config always wins.
+// Resolve picks the config path for a run: a non-empty explicit --config
+// always wins, an empty one means "resolve".
 func Resolve(explicit string) string {
 	if explicit != "" {
 		return explicit

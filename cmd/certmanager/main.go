@@ -26,7 +26,11 @@ func main() {
 // it writes nothing to stderr: Puppet's generate() runs this binary with
 // combine: true, which splices stderr into the stdout that parsejson() reads.
 func run(args []string, stdout, stderr io.Writer) int {
-	cmd := rootCmd()
+	return runWith(args, stdout, stderr, isTerminal(stdout))
+}
+
+func runWith(args []string, stdout, stderr io.Writer, interactive bool) int {
+	cmd := rootCmd(interactive)
 	cmd.SetArgs(args)
 	cmd.SetOut(stdout)
 	cmd.SetErr(stderr)
@@ -38,7 +42,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func rootCmd() *cobra.Command {
+// isTerminal reports whether w is a terminal. Puppet's generate() captures
+// stdout through a pipe, so anything else is a machine caller.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+// resolveConfig turns the --config value into a path. An explicitly empty
+// --config is a malformed call, not a request to resolve.
+func resolveConfig(cmd *cobra.Command, explicit string) (string, error) {
+	if explicit == "" && cmd.Flags().Changed("config") {
+		return "", fmt.Errorf("--config requires a path")
+	}
+	return config.Resolve(explicit), nil
+}
+
+func rootCmd(interactive bool) *cobra.Command {
 	var (
 		cfgFile    string
 		altNames   string
@@ -57,15 +81,19 @@ func rootCmd() *cobra.Command {
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				// A bare invocation is someone asking what this is; flags
-				// without a common name is a malformed call and must fail.
-				if cmd.Flags().NFlag() == 0 {
+				// Help only for a human at a terminal: under generate() an
+				// argv that lost its common name must fail the compile.
+				if interactive && cmd.Flags().NFlag() == 0 {
 					return cmd.Help()
 				}
 				return fmt.Errorf("a common name is required")
 			}
 
-			cfg, err := config.Load(config.Resolve(cfgFile))
+			path, err := resolveConfig(cmd, cfgFile)
+			if err != nil {
+				return err
+			}
+			cfg, err := config.Load(path)
 			if err != nil {
 				return err
 			}
@@ -116,7 +144,11 @@ func caCmd(cfgFile *string) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.LoadCA(config.Resolve(*cfgFile))
+			path, err := resolveConfig(cmd, *cfgFile)
+			if err != nil {
+				return err
+			}
+			cfg, err := config.LoadCA(path)
 			if err != nil {
 				return err
 			}

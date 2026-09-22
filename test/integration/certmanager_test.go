@@ -272,9 +272,24 @@ func writeConfig(t *testing.T, dir, roleID string) string {
 	return path
 }
 
+// hermeticEnv strips the developer's environment from the subprocess. The
+// tests claim to exercise the baked-in config path, so a real
+// ~/.config/certmanager/config.yaml must not resolve ahead of it and point the
+// binary at a production Vault.
+func hermeticEnv(t *testing.T) []string {
+	t.Helper()
+	empty := t.TempDir()
+	return []string{
+		"PATH=/usr/bin:/bin",
+		"HOME=" + empty,
+		"XDG_CONFIG_HOME=" + empty,
+	}
+}
+
 func runCertmanager(t *testing.T, bin string, args ...string) (int, string, string) {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
+	cmd.Env = hermeticEnv(t)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -471,6 +486,41 @@ func TestCAChainNeedsNoCredentials(t *testing.T) {
 	}
 	if len(parseChain(t, stdout)) != 2 {
 		t.Errorf("credential-free ca output is not the two certificate chain: %q", stdout)
+	}
+}
+
+// A developer with a real ~/.config/certmanager/config.yaml must not have it
+// leak into the subprocess, which would run the suite against their Vault.
+func TestIgnoresTheDevelopersConfig(t *testing.T) {
+	waitForVault(t)
+	roleID := setupVault(t)
+
+	dir := t.TempDir()
+	bin := buildBinary(t, dir, writeConfig(t, dir, roleID))
+
+	poisoned := t.TempDir()
+	cfgDir := filepath.Join(poisoned, "certmanager")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := "vault:\n  addr: http://127.0.0.1:1\n  mount_point: nope\n  role_name: nope\n" +
+		"  approle_path: approle\n  role_id: nope\n"
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", poisoned)
+	t.Setenv("HOME", poisoned)
+
+	code, stdout, stderr := runCertmanager(t, bin, commonName, "--json")
+	if code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr)
+	}
+	var doc map[string]string
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout)
+	}
+	if doc["certificate"] == "" {
+		t.Error("no certificate issued; the baked-in config path was not used")
 	}
 }
 

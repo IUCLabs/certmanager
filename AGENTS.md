@@ -46,9 +46,10 @@ dist/                         # build output: binaries, RPM, checksums (not comm
   wires it to the real streams and `os.Exit`. Cobra runs with `SilenceUsage` and
   `SilenceErrors` so nothing reaches stderr unless the run failed.
 - **Flat CLI**: the root command takes `common_name` positionally
-  (`cobra.MaximumNArgs(1)`); no args prints help, args-less flags fail. `ca`,
-  `completion` and `help` are the only subcommands; `--config` is persistent so
-  `ca` shares it.
+  (`cobra.MaximumNArgs(1)`); no args prints help only when stdout is a terminal
+  and otherwise fails, args-less flags fail. `ca`, `completion` and `help` are
+  the only subcommands; `--config` is persistent so `ca` shares it, and an
+  explicitly empty `--config` is rejected.
 - **`ca` is unauthenticated**: `GET {addr}/v1/{mount}/ca_chain` sends no
   `X-Vault-Token` and loads the config through `config.LoadCA`, which requires
   only `vault.addr`. The body is parsed as PEM, never sniffed — Vault labels it

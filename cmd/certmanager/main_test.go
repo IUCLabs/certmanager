@@ -772,11 +772,11 @@ func TestRunCAFailures(t *testing.T) {
 	}
 }
 
-// A bare invocation is a human at a terminal, not Puppet: print help and exit
-// zero rather than failing on the missing positional.
-func TestRunNoArgsPrintsHelp(t *testing.T) {
+// A bare invocation at a terminal is a human asking what this is: print help
+// and exit zero rather than failing on the missing positional.
+func TestRunNoArgsOnATerminalPrintsHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run(nil, &stdout, &stderr); code != 0 {
+	if code := runWith([]string{}, &stdout, &stderr, true); code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Usage:") {
@@ -787,6 +787,97 @@ func TestRunNoArgsPrintsHelp(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// generate() splices stderr into stdout and reads the result as JSON, so an
+// argv that lost its common name must fail loudly with nothing on stdout.
+func TestRunNoArgsWithoutATerminalFails(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runWith([]string{}, &stdout, &stderr, false)
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero (stdout %q)", stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "a common name is required") {
+		t.Errorf("stderr = %q, want it to name the missing common name", stderr.String())
+	}
+}
+
+// run() decides interactivity from the real stdout, so a piped stdout must not
+// take the help path.
+func TestRunNoArgsPipedStdoutFails(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	var stderr bytes.Buffer
+	code := run([]string{}, w, &stderr)
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero (stdout %q)", out)
+	}
+	if len(out) != 0 {
+		t.Errorf("stdout = %q, want empty", out)
+	}
+}
+
+func TestIsTerminal(t *testing.T) {
+	var buf bytes.Buffer
+	if isTerminal(&buf) {
+		t.Error("a bytes.Buffer is not a terminal")
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+	defer func() { _ = w.Close() }()
+	if isTerminal(w) {
+		t.Error("a pipe is not a terminal")
+	}
+
+	tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skipf("no controlling terminal: %v", err)
+	}
+	defer func() { _ = tty.Close() }()
+	if !isTerminal(tty) {
+		t.Error("/dev/tty is a terminal")
+	}
+}
+
+// --config with an empty value is a malformed call, not a request to resolve.
+func TestRunRejectsEmptyConfigFlag(t *testing.T) {
+	srv, _ := newVaultStub(t, stubOptions{})
+	seedXDGConfig(t, srv.URL)
+
+	for _, args := range [][]string{
+		{"host.example.com", "--config", "", "--json"},
+		{"ca", "--config", ""},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := run(args, &stdout, &stderr)
+		if code == 0 {
+			t.Fatalf("%v: exit code = 0, want non-zero (stdout %q)", args, stdout.String())
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("%v: stdout = %q, want empty", args, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "--config requires a path") {
+			t.Errorf("%v: stderr = %q", args, stderr.String())
+		}
 	}
 }
 
