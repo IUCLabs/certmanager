@@ -44,11 +44,17 @@ dist/                         # build output: binaries, RPM, checksums (not comm
 
 - **`run(args, stdout, stderr) int`** is the testable entry point; `main()` only
   wires it to the real streams and `os.Exit`. Cobra runs with `SilenceUsage` and
-  `SilenceErrors` so nothing reaches stderr unless the run failed.
+  `SilenceErrors` so nothing reaches stderr unless the run failed. `run` derives
+  interactivity from `isTerminal(stdout)` and hands it to `runWith`, which tests
+  call directly to pin either side. `isTerminal` is a terminal ioctl
+  (`x/term.IsTerminal`), not a character-device stat: `/dev/null` and the
+  `/dev/null` the runtime reopens onto a closed fd 1 are character devices, and
+  a stat would hand both of them the help-and-exit-zero path.
 - **Flat CLI**: the root command takes `common_name` positionally
-  (`cobra.MaximumNArgs(1)`); no args prints help, args-less flags fail. `ca`,
-  `completion` and `help` are the only subcommands; `--config` is persistent so
-  `ca` shares it.
+  (`cobra.MaximumNArgs(1)`); no args prints help only when stdout is a terminal
+  and otherwise fails, args-less flags fail. `ca`, `completion` and `help` are
+  the only subcommands; `--config` is persistent so `ca` shares it, and an
+  explicitly empty `--config` is rejected.
 - **`ca` is unauthenticated**: `GET {addr}/v1/{mount}/ca_chain` sends no
   `X-Vault-Token` and loads the config through `config.LoadCA`, which requires
   only `vault.addr`. The body is parsed as PEM, never sniffed — Vault labels it
@@ -103,6 +109,18 @@ runs the binary with Puppet's argv and asserts exit code, empty stderr, the
 four JSON keys, the parsed X.509 CN/SANs/lifetime, and that a refused name
 exits non-zero with empty stdout. Dev mode is plain HTTP, so it does not
 exercise the TLS path.
+
+`hermeticEnv`, the subprocess environment those tests share, sits outside the
+tag in `hermetic_env_test.go` so a plain `go test ./...` guards it. It replaces
+the ambient environment rather than extending it; its test asserts exactly
+that, because a helper that leaked `HOME` would point the binary at a real
+Vault and only the tagged tests would notice.
+
+`TestBareInvocationHelpsOnlyATerminal` drives the built binary once per kind of
+fd 1 — pipe, regular file, unix socket, `/dev/null`, a closed fd 1 and a pty
+allocated from `/dev/ptmx` — and only the pty may exit zero with help on
+stdout. The pty is what pins the true branch: CI containers have no
+controlling terminal, so a test that reached for `/dev/tty` would skip.
 
 ## Gotchas
 

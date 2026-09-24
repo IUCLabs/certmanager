@@ -204,7 +204,7 @@ func TestDefaultPathIgnoresADirectory(t *testing.T) {
 
 func TestResolvePrefersExplicitPath(t *testing.T) {
 	xdg := t.TempDir()
-	seedConfig(t, xdg)
+	resolved := seedConfig(t, xdg)
 	t.Setenv("XDG_CONFIG_HOME", xdg)
 	t.Setenv("HOME", t.TempDir())
 
@@ -212,8 +212,22 @@ func TestResolvePrefersExplicitPath(t *testing.T) {
 	if got := Resolve(explicit); got != explicit {
 		t.Errorf("Resolve(%q) = %q, want the explicit path", explicit, got)
 	}
-	if got := Resolve(""); got == explicit {
-		t.Error("Resolve(\"\") returned the explicit path")
+	if got := Resolve(""); got != resolved {
+		t.Errorf("Resolve(\"\") = %q, want the resolved path %q", got, resolved)
+	}
+}
+
+// The XDG spec says a non-absolute XDG_CONFIG_HOME must be ignored, so a
+// config sitting under the working directory cannot be picked up.
+func TestDefaultPathIgnoresRelativeXDG(t *testing.T) {
+	wd := t.TempDir()
+	seedConfig(t, filepath.Join(wd, "xdg"))
+	t.Chdir(wd)
+	t.Setenv("XDG_CONFIG_HOME", "xdg")
+	t.Setenv("HOME", t.TempDir())
+
+	if got := DefaultPath(); got != FallbackPath() {
+		t.Errorf("DefaultPath() = %q, want %q", got, FallbackPath())
 	}
 }
 

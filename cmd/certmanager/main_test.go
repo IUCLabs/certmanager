@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -772,11 +773,11 @@ func TestRunCAFailures(t *testing.T) {
 	}
 }
 
-// A bare invocation is a human at a terminal, not Puppet: print help and exit
-// zero rather than failing on the missing positional.
-func TestRunNoArgsPrintsHelp(t *testing.T) {
+// A bare invocation at a terminal is a human asking what this is: print help
+// and exit zero rather than failing on the missing positional.
+func TestRunNoArgsOnATerminalPrintsHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run(nil, &stdout, &stderr); code != 0 {
+	if code := runWith([]string{}, &stdout, &stderr, true); code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Usage:") {
@@ -787,6 +788,153 @@ func TestRunNoArgsPrintsHelp(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+// generate() splices stderr into stdout and reads the result as JSON, so an
+// argv that lost its common name must fail loudly with nothing on stdout.
+func TestRunNoArgsWithoutATerminalFails(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runWith([]string{}, &stdout, &stderr, false)
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero (stdout %q)", stdout.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "a common name is required") {
+		t.Errorf("stderr = %q, want it to name the missing common name", stderr.String())
+	}
+}
+
+// run() decides interactivity from the real stdout, so a piped stdout must not
+// take the help path.
+func TestRunNoArgsPipedStdoutFails(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	var stderr bytes.Buffer
+	code := run([]string{}, w, &stderr)
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero (stdout %q)", out)
+	}
+	if len(out) != 0 {
+		t.Errorf("stdout = %q, want empty", out)
+	}
+}
+
+// Every stdout a machine caller can hand the binary must read as
+// not-a-terminal. /dev/null is the trap: it is a character device, so a stat of
+// the file mode calls it a terminal and lets help escape with exit zero.
+func TestIsTerminalRejectsNonTerminals(t *testing.T) {
+	var buf bytes.Buffer
+	if isTerminal(&buf) {
+		t.Error("a bytes.Buffer is not a terminal")
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+
+	regular, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	t.Cleanup(func() { _ = regular.Close() })
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	t.Cleanup(func() { _ = devNull.Close() })
+
+	for name, f := range map[string]*os.File{
+		"pipe":         w,
+		"regular file": regular,
+		os.DevNull:     devNull,
+		"unix socket":  unixSocket(t),
+	} {
+		if isTerminal(f) {
+			t.Errorf("%s is not a terminal", name)
+		}
+		// An explicit empty argv, never nil: cobra falls back to os.Args[1:]
+		// for a nil one, which under `go test -args foo` would turn this into
+		// `certmanager foo` and issue against whatever Vault the host's
+		// config resolves to. The stderr assertion is what catches that.
+		var stderr bytes.Buffer
+		code := run([]string{}, f, &stderr)
+		if code == 0 {
+			t.Errorf("%s: bare invocation exit code = 0, want non-zero", name)
+		}
+		if want := "a common name is required"; !strings.Contains(stderr.String(), want) {
+			t.Errorf("%s: stderr = %q, want it to contain %q", name, stderr.String(), want)
+		}
+	}
+}
+
+// unixSocket returns a connected unix socket as an *os.File: the stdout a
+// caller gets when it wires the binary straight into a service.
+func unixSocket(t *testing.T) *os.File {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "s")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			_, _ = io.Copy(io.Discard, conn)
+			_ = conn.Close()
+		}
+	}()
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	f, err := conn.(*net.UnixConn).File()
+	if err != nil {
+		t.Fatalf("socket file: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// --config with an empty value is a malformed call, not a request to resolve.
+func TestRunRejectsEmptyConfigFlag(t *testing.T) {
+	srv, _ := newVaultStub(t, stubOptions{})
+	seedXDGConfig(t, srv.URL)
+
+	for _, args := range [][]string{
+		{"host.example.com", "--config", "", "--json"},
+		{"ca", "--config", ""},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := run(args, &stdout, &stderr)
+		if code == 0 {
+			t.Fatalf("%v: exit code = 0, want non-zero (stdout %q)", args, stdout.String())
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("%v: stdout = %q, want empty", args, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "--config requires a path") {
+			t.Errorf("%v: stderr = %q", args, stderr.String())
+		}
 	}
 }
 
