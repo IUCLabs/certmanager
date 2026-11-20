@@ -34,9 +34,10 @@ internal/config/              # YAML config: parsing, defaults, validation
 internal/pki/                 # issue + ca_chain requests and the output shapes
 internal/vault/               # HTTP client: approle, kubernetes, unauthenticated
 Makefile                      # build / test / lint / completions / version bump
-.goreleaser.yaml              # single release driver: binaries + RPM + Gitea release
+.goreleaser.yaml              # single release driver: binaries + RPM + GitHub release
 scripts/integration-test.sh   # runs the integration test against a Vault dev server
-.woodpecker/                  # CI: build, test, integration, pre-commit (PR) + release (tag)
+.woodpecker/                  # PR CI on Gitea: build, test, integration, pre-commit
+.github/workflows/            # GitHub CI + release (tag)
 dist/                         # build output: binaries, RPM, checksums (not committed)
 ```
 

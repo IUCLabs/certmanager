@@ -186,15 +186,12 @@ Point it at an existing dev server with `CERTMANAGER_IT_VAULT_ADDR`
 
 ## Releasing
 
-goreleaser drives the whole release from a `v*` tag:
+GitHub Actions runs goreleaser on a `v*` tag and publishes the GitHub release:
 
 - raw binaries `certmanager-<os>-<arch>` (linux/darwin, amd64/arm64) attached to
-  the Gitea release — the puppetserver-compiler initContainer fetches one file
+  the release — the puppetserver-compiler initContainer fetches one file
   by URL and checksums it, so it cannot unpack an archive;
-- `tar.gz` archives and `checksums.txt`;
+- `tar.gz` archives and `checksums.txt` (with a detached signature);
 - `certmanager-<version>-1.<arch>.rpm`, installing `/usr/bin/certmanager`,
   symlinking `/usr/local/bin/certmanager` (the path Puppet calls) and shipping
   bash/zsh/fish completions.
-
-The release pipeline then `PUT`s the RPM to the artifactapi `rpm-internal`
-repo, which goreleaser cannot do itself.
