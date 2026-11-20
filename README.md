@@ -125,7 +125,9 @@ non-200, an empty body or anything else exits non-zero with nothing on stdout.
 
 `generate()` merges the command's stderr into its stdout, so the contract above
 means the JSON can go straight to `parsejson()` and a failure aborts the
-compile with a readable error. A minimal example:
+compile with a readable error. The binary path depends on the install method:
+the RPM provides `/usr/local/bin/certmanager`; for a raw binary or tarball
+install, use wherever you put it. A minimal example:
 
 ```puppet
 $cert = parsejson(generate(
@@ -162,7 +164,7 @@ built-in path.
 |---|---|---|---|
 | `addr` | yes | | e.g. `https://vault.example.com:8200` |
 | `auth_method` | no | `approle` | `approle` or `kubernetes` |
-| `mount_point` | yes | | e.g. `pki_int` |
+| `mount_point` | yes for issuing; `ca` can use `--mount` instead | | e.g. `pki_int` |
 | `role_name` | iff issuing | | e.g. `my-role` |
 | `role_id` | iff `approle` and issuing | | |
 | `approle_path` | iff `approle` and issuing | | e.g. `approle` |
