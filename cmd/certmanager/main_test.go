@@ -36,7 +36,8 @@ type stubOptions struct {
 	approleStatus int
 	k8sStatus     int
 	issueStatus   int
-	issueDelay    time.Duration
+	// issueHang blocks the issue call until the client gives up.
+	issueHang bool
 
 	caStatus int
 	// caBody overrides the CA chain response; caBodySet distinguishes an
@@ -121,8 +122,11 @@ func newVaultStub(t *testing.T, opts stubOptions) (*httptest.Server, *capture) {
 		login(w, r, orOK(opts.k8sStatus))
 	})
 	mux.HandleFunc("/v1/pki_int/issue/my-role", func(w http.ResponseWriter, r *http.Request) {
-		if opts.issueDelay > 0 {
-			time.Sleep(opts.issueDelay)
+		if opts.issueHang {
+			// Draining the body lets the server notice the client hanging up.
+			_, _ = io.Copy(io.Discard, r.Body)
+			<-r.Context().Done()
+			return
 		}
 		got.token = r.Header.Get("X-Vault-Token")
 		got.issueBody = decode(r)
@@ -373,9 +377,9 @@ func TestRunFailures(t *testing.T) {
 		},
 		{
 			name: "vault times out",
-			opts: stubOptions{issueDelay: 400 * time.Millisecond},
+			opts: stubOptions{issueHang: true},
 			config: func(t *testing.T, addr string) string {
-				return approleConfig(t, addr, "  timeout: 50ms\n")
+				return approleConfig(t, addr, "  timeout: 500ms\n")
 			},
 			wantErr: "POST pki_int/issue/my-role",
 		},
