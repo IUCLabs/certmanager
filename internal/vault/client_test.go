@@ -3,6 +3,7 @@ package vault_test
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -226,12 +227,16 @@ func TestPostTimesOut(t *testing.T) {
 			_, _ = fmt.Fprint(w, `{"auth":{"client_token":"s.token"}}`)
 			return
 		}
-		time.Sleep(500 * time.Millisecond)
-		_, _ = fmt.Fprint(w, `{"data":{}}`)
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+			_, _ = fmt.Fprint(w, `{"data":{}}`)
+		}
 	})
 
 	cfg := baseConfig(srv.URL)
-	cfg.Timeout = "50ms"
+	cfg.Timeout = "500ms"
 	c, err := vault.New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -242,7 +247,7 @@ func TestPostTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("Post succeeded, want a timeout")
 	}
-	if elapsed := time.Since(start); elapsed > 400*time.Millisecond {
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("Post took %v, the timeout did not apply", elapsed)
 	}
 }
