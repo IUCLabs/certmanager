@@ -84,14 +84,10 @@ nfpms:
 checksum:
   name_template: "checksums.txt"
 
-release:
-  gitea:
-    owner: myorg
-    name: certmanager
-
-gitea_urls:
-  api: https://git.example.com/api/v1
-  download: https://git.example.com
+signs:
+  - artifacts: checksum
+    cmd: scripts/sign.sh
+    args: ["${artifact}", "${signature}"]
 
 changelog:
   sort: asc
