@@ -1,20 +1,42 @@
 # certmanager
 
-Issues Vault PKI certificates for Puppet-managed nodes. Drop-in replacement for
-the Python `certmanager` script deployed by `profiles::helpers::certmanager`,
-compiled to a single static binary with no runtime dependencies.
+Issues X.509 certificates from a [Vault](https://www.vaultproject.io/) (or
+OpenBao) PKI secrets engine and prints the PKI mount's CA chain. It is a single
+static binary designed to be called from Puppet's `generate()` function during
+catalog compilation, so a Puppet server can hand each node a certificate, key
+and CA chain, but it works as a standalone CLI too.
 
-Puppet calls it server-side during catalog compilation from
-`profiles::pki::vault`:
+It authenticates to Vault with AppRole or Kubernetes auth, calls
+`POST /v1/<mount_point>/issue/<role_name>`, and either prints the result as
+JSON or writes it to files.
 
+## Install
+
+Download a release from
+[GitHub releases](https://github.com/IUCLabs/certmanager/releases):
+
+- `certmanager-<version>-1.<arch>.rpm` installs `/usr/bin/certmanager`, a
+  `/usr/local/bin/certmanager` symlink and bash/zsh/fish completions.
+- `certmanager-<os>-<arch>` is the raw binary (linux/darwin, amd64/arm64).
+- `certmanager_<version>_<os>_<arch>.tar.gz` holds the binary, README and
+  completions.
+
+Verify downloads against `checksums.txt`, which is signed with a detached GPG
+signature (`checksums.txt.sig`):
+
+```bash
+gpg --verify checksums.txt.sig checksums.txt
+sha256sum --check --ignore-missing checksums.txt
 ```
-/usr/local/bin/certmanager <fqdn> --alt-names "host,fqdn" --ip-sans "127.0.0.1,<ip>" --expiry-days 90 --json
-```
 
-`generate()` runs the binary with `combine: true`, which splices stderr into the
-stdout that `parsejson()` reads — so on the success path the binary writes
-nothing but the JSON document to stdout, and nothing at all to stderr. Every
-failure path exits non-zero.
+Or build from source (Go per `go.mod`):
+
+```bash
+git clone https://github.com/IUCLabs/certmanager.git
+cd certmanager
+make build    # -> dist/certmanager (CGO disabled, static)
+make install  # go install into $GOPATH/bin
+```
 
 ## Usage
 
@@ -24,15 +46,18 @@ certmanager ca [flags]              # print the CA chain
 certmanager                         # print help (interactive terminals only)
 ```
 
-The common name is positional, with no `pki` subcommand in front of it — that
-is the form Puppet calls, and it is the only issuing form. `ca`, `completion`
-and `help` are the subcommands; every other first argument is a common name.
+```bash
+certmanager host.example.com --alt-names "host,host.example.com" \
+  --ip-sans "127.0.0.1,192.0.2.10" --expiry-days 90 --json
+```
 
-A bare invocation prints help and exits zero only when stdout is a terminal —
-a pipe, a file, a socket, `/dev/null` and a closed fd 1 all exit non-zero with
-nothing on stdout. Puppet's `generate()` collects stdout through a temp file,
-so there a missing common name fails the compile rather than feeding help text
-into the catalog.
+The common name is positional. `ca`, `completion` and `help` are the
+subcommands; every other first argument is a common name.
+
+A bare invocation prints help and exits zero only when stdout is a terminal. A
+pipe, a file, `/dev/null` or a closed stdout exits non-zero with nothing on
+stdout, so a call that lost its common name fails instead of emitting help
+text.
 
 | Flag | Short | Type | Default | Description |
 |---|---|---|---|---|
@@ -51,6 +76,9 @@ into the catalog.
 
 Comma lists are split on `,`, whitespace-trimmed, and empty tokens dropped.
 
+On success nothing is written to stderr; every failure prints the cause to
+stderr and exits non-zero.
+
 ### JSON output
 
 ```json
@@ -61,11 +89,8 @@ Comma lists are split on `,`, whitespace-trimmed, and empty tokens dropped.
 }
 ```
 
-`full_chain` is leaf first, the order every TLS server expects.
-
-The CA is not part of this document. It is estate-wide and public, so binding
-it to a node's issuance would pin CA distribution to that node's renewal cycle;
-`certmanager ca` fetches it instead.
+`full_chain` is leaf first, the order TLS servers expect. The CA chain is not
+part of this document; fetch it with `certmanager ca`.
 
 ### File output
 
@@ -81,34 +106,40 @@ Without `--json` the certificate is written under `vault.output_path`
 With `-c` the same three files are written into
 `<output_path>/<common_name>.zip`.
 
-## The `ca` subcommand
+### The `ca` subcommand
 
 ```
 certmanager ca [--mount <pki_mount>] [--config <path>]
 ```
 
-Prints the mount's CA chain to stdout as raw PEM — not JSON, because Puppet
-uses it as file content directly:
+Prints the mount's CA chain to stdout as raw PEM, read unauthenticated from
+`GET /v1/<mount>/ca_chain`. A config carrying only `addr` and `mount_point` is
+enough, and `--mount` overrides the configured mount.
+
+`/ca_chain` returns the intermediate **and** the root, unlike `issuing_ca` or
+`/ca/pem`, so the output works as a standalone `CAfile` for path builders that
+require a self-signed anchor. The response must be a PEM certificate chain; a
+non-200, an empty body or anything else exits non-zero with nothing on stdout.
+
+### Puppet
+
+`generate()` merges the command's stderr into its stdout, so the contract above
+means the JSON can go straight to `parsejson()` and a failure aborts the
+compile with a readable error. A minimal example:
 
 ```puppet
+$cert = parsejson(generate(
+  '/usr/local/bin/certmanager', $facts['networking']['fqdn'],
+  '--alt-names', "${facts['networking']['hostname']},${facts['networking']['fqdn']}",
+  '--ip-sans', "127.0.0.1,${facts['networking']['ip']}",
+  '--expiry-days', '90',
+  '--json',
+))
+
 file { '/etc/pki/tls/vault/ca_certificate.crt':
   content => generate('/usr/local/bin/certmanager', 'ca'),
 }
 ```
-
-It reads `GET {addr}/v1/{mount}/ca_chain` unauthenticated: no AppRole login, no
-Kubernetes login, no token header. A config carrying only `addr` and
-`mount_point` is enough, and `--mount` overrides the configured mount.
-
-`/ca_chain` returns the intermediate **and** the root, unlike `issuing_ca` or
-`/ca/pem`, which return the intermediate alone. An intermediate-only `CAfile`
-is not self-sufficient: strict path builders that require a chain to a
-self-signed root reject it.
-
-The endpoint advertises `application/pkix-cert` while serving PEM, so the body
-is parsed rather than sniffed. A non-200, an empty body or anything that is not
-a PEM certificate chain exits non-zero with the cause on stderr and nothing on
-stdout.
 
 ## Configuration
 
@@ -116,19 +147,16 @@ YAML, everything nested under `vault:`.
 
 ### Config resolution order
 
-1. `--config <path>`, which always wins; an empty `--config ''` is an error,
-   not a request to resolve;
+1. `--config <path>`, which always wins; an empty `--config ''` is an error;
 2. `$XDG_CONFIG_HOME/certmanager/config.yaml`, if `$XDG_CONFIG_HOME` is
    absolute and the file exists;
 3. `$HOME/.config/certmanager/config.yaml`, if the file exists;
 4. `/opt/certmanager/config.yaml`, the path baked in at build time
    (`make build CONFIG_PATH=...`).
 
-Steps 2 and 3 are skipped unless the file is really there, so the last step is
-what Puppet gets: `generate()` runs the binary as the `puppet` user with no
-usable home directory, and `profiles::helpers::certmanager` writes the config
-to `/opt/certmanager/config.yaml` on managed nodes. The k8s puppetserver
-compilers mount it at the same path.
+Steps 2 and 3 are skipped unless the file exists, so a service user without a
+usable home directory (such as `puppet` under `generate()`) lands on the
+built-in path.
 
 | Key | Required | Default | Notes |
 |---|---|---|---|
@@ -139,10 +167,10 @@ compilers mount it at the same path.
 | `role_id` | iff `approle` and issuing | | |
 | `approle_path` | iff `approle` and issuing | | e.g. `approle` |
 | `k8s_mount` | iff `kubernetes` and issuing | | e.g. `kubernetes` |
-| `k8s_role` | iff `kubernetes` and issuing | | e.g. `my-certmanager-role` |
+| `k8s_role` | iff `kubernetes` and issuing | | e.g. `my-role` |
 | `jwt_path` | no | `/var/run/secrets/kubernetes.io/serviceaccount/token` | |
 | `output_path` | no | `.` | Non-JSON output directory |
-| `tls_skip_verify` | no | `true` | Set `false` once every node trusts the CA |
+| `tls_skip_verify` | no | `true` | Set `false` when Vault's certificate is trusted by the host |
 | `timeout` | no | `30s` | Per-request Vault timeout |
 
 ```yaml
@@ -153,12 +181,12 @@ vault:
   role_id: <role_id>
   mount_point: pki_int
   role_name: my-role
-  output_path: /tmp/certmanager
+  output_path: /var/lib/certmanager
 ```
 
 `ca` requires only `addr` and a mount; every auth key above is optional for it.
 
-AppRole logs in with `role_id` only — the Vault role sets
+AppRole logs in with `role_id` only, so the Vault role must set
 `bind_secret_id: false`. Kubernetes reads the JWT from `jwt_path` and posts it
 with `k8s_role`. A missing, unreadable or empty JWT, a rejected login, or an
 unknown `auth_method` each fail naming the cause; there is no fallback between
@@ -167,31 +195,23 @@ methods.
 ## Development
 
 ```sh
-make build        # -> dist/certmanager (CGO disabled, static)
-make test         # go test -v -race ./...
-make lint         # golangci-lint
-make pre-commit   # uvx pre-commit run --all-files
+make build             # -> dist/certmanager (CGO disabled, static)
+make test              # go test -v -race ./...
+make lint              # golangci-lint
+make pre-commit        # uvx pre-commit run --all-files
 make completions       # -> dist/completions/
 make integration-test  # end-to-end against a real Vault dev server
 make release-snapshot  # goreleaser: binaries, tar.gz and RPM into dist/
 ```
 
 `make integration-test` starts a `hashicorp/vault` dev container with
-docker/podman, provisions a PKI mount and an approle role, then runs the built
-binary with the exact argv Puppet uses and asserts on the issued certificate. A
-root mount signs an intermediate so the CA chain under test is the two
-certificate shape production serves.
-Point it at an existing dev server with `CERTMANAGER_IT_VAULT_ADDR`
-(`VAULT_ADDR` is deliberately ignored — the test writes to the PKI mount).
+docker/podman, provisions a root and intermediate PKI mount and an AppRole
+role, then runs the built binary and asserts on the issued certificate and CA
+chain. Point it at an existing dev server with `CERTMANAGER_IT_VAULT_ADDR`
+(`VAULT_ADDR` is deliberately ignored, because the test writes to the PKI
+mount).
 
-## Releasing
+## Releases
 
-GitHub Actions runs goreleaser on a `v*` tag and publishes the GitHub release:
-
-- raw binaries `certmanager-<os>-<arch>` (linux/darwin, amd64/arm64) attached to
-  the release — the puppetserver-compiler initContainer fetches one file
-  by URL and checksums it, so it cannot unpack an archive;
-- `tar.gz` archives and `checksums.txt` (with a detached signature);
-- `certmanager-<version>-1.<arch>.rpm`, installing `/usr/bin/certmanager`,
-  symlinking `/usr/local/bin/certmanager` (the path Puppet calls) and shipping
-  bash/zsh/fish completions.
+Pushing a `v*` tag runs GitHub Actions, where GoReleaser publishes the raw
+binaries, tarballs, the RPM and a signed `checksums.txt` to the GitHub release.
